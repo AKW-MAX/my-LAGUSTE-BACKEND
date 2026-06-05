@@ -10,11 +10,22 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-const mongoUri = process.env.MONGO_URI || "mongodb+srv://agneswanini066_db_user:Midlinkkwa2@cluster0.1oxo8wl.mongodb.net/laguste?retryWrites=true&w=majority";
+const mongoUri = process.env.MONGO_URI;
 
-mongoose.connect(mongoUri)
-  .then(() => console.log('MongoDB connected'))
-  .catch(err => console.error('MongoDB connection error:', err));
+const ports = process.env.PORT || 5000;
+
+const startServer = async () => {
+  try {
+    await mongoose.connect(mongoUri);
+    console.log('MongoDB connected');
+    app.listen(ports, () => {
+      console.log(`Server is running on port ${ports}`);
+    });
+  } catch (err) {
+    console.error('MongoDB connection error:', err);
+    process.exit(1);
+  }
+};
 
 app.get('/Products', (req, res) => {
   res.send(Products);
@@ -79,7 +90,5 @@ app.post('/login', async (req, res) => {
     return res.status(500).json({ message: 'Login failed', error: err.message });
   }
 });
-const ports = process.env.PORT || 5000;
 
-app.listen(ports, () => {  console.log(`Server is running on port ${ports}`);
-});
+startServer();
