@@ -43,7 +43,7 @@ npm start
 
 The server will run on:
 
-http://localhost:5000
+https://agriventure-enterprise-backend.onrender.com
 API Endpoints
 Get Products
 
