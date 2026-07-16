@@ -2,12 +2,17 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
 const mongoose = require('mongoose');
+const crypto = require('crypto');
+const nodemailer = require("nodemailer");
 require('dotenv').config();
+const jwt = require("jsonwebtoken");
 
 const Products = require('./models/Products');
 const Customer = require('./models/customers');
 const Order = require('./models/orders'); // FIXED NAME
-
+const adminAuth = require("./middleware/adminAuths");
+const AdminModel = require("./models/admin");
+const AdminAuditLog = require("./models/adminAuditLog");
 
 const app = express();
 app.use(express.json());
@@ -15,24 +20,282 @@ app.use(cors());
 
 const mongoUri = process.env.MONGO_URI;
 const ports = process.env.PORT || 5000;
+const ALL_ADMIN_PERMISSIONS = [
+  "manage_orders",
+  "manage_products",
+  "add_product",
+  "add_admin",
+];
+const MAX_FAILED_LOGIN_ATTEMPTS = 5;
+const ADMIN_LOCK_MINUTES = 15;
+const PASSWORD_RESET_TOKEN_TTL_MINUTES = 15;
+const ADMIN_LOGIN_RATE_WINDOW_MS = 10 * 60 * 1000;
+const ADMIN_LOGIN_MAX_ATTEMPTS_PER_IP = 30;
+const CLOUDINARY_UPLOAD_FOLDER = process.env.CLOUDINARY_FOLDER || "laguste-products";
+const CLOUDINARY_CLOUD_NAME =
+  process.env.CLOUDINARY_CLOUD_NAME ||
+  process.env.VITE_CLOUDINARY_CLOUD_NAME ||
+  "";
+const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY || "";
+const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET || "";
+const CLOUDINARY_PRODUCT_IMAGE_TRANSFORMATION = "c_fill,g_auto,w_480,h_600,q_auto,f_auto";
+const SMTP_HOST = process.env.SMTP_HOST || "";
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_USER = process.env.SMTP_USER || "";
+const SMTP_PASS = process.env.SMTP_PASS || "";
+const SMTP_SECURE = String(process.env.SMTP_SECURE || "false").toLowerCase() === "true";
+const EMAIL_FROM = process.env.EMAIL_FROM || SMTP_USER;
+const adminLoginRateMap = new Map();
+
+const getMissingCloudinaryConfigKeys = () => {
+  const missing = [];
+
+  if (!CLOUDINARY_CLOUD_NAME) missing.push("CLOUDINARY_CLOUD_NAME");
+  if (!CLOUDINARY_API_KEY) missing.push("CLOUDINARY_API_KEY");
+  if (!CLOUDINARY_API_SECRET) missing.push("CLOUDINARY_API_SECRET");
+
+  return missing;
+};
+
+const isAdminLoginRateLimited = (ipAddress) => {
+  const now = Date.now();
+  const current = adminLoginRateMap.get(ipAddress);
+
+  if (!current || now > current.windowStart + ADMIN_LOGIN_RATE_WINDOW_MS) {
+    adminLoginRateMap.set(ipAddress, { count: 1, windowStart: now });
+    return false;
+  }
+
+  current.count += 1;
+  adminLoginRateMap.set(ipAddress, current);
+
+  return current.count > ADMIN_LOGIN_MAX_ATTEMPTS_PER_IP;
+};
+
+const isStrongPassword = (password) => {
+  if (typeof password !== "string") return false;
+
+  // At least 8 chars, upper, lower, number, special.
+  return /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).{8,}$/.test(password);
+};
+
+const getMissingEmailConfigKeys = () => {
+  const missing = [];
+  if (!SMTP_HOST) missing.push("SMTP_HOST");
+  if (!SMTP_PORT) missing.push("SMTP_PORT");
+  if (!SMTP_USER) missing.push("SMTP_USER");
+  if (!SMTP_PASS) missing.push("SMTP_PASS");
+  if (!EMAIL_FROM) missing.push("EMAIL_FROM");
+
+  // Treat template/example placeholders as missing to avoid confusing SMTP runtime errors.
+  const placeholderValues = new Set([
+    "smtp.example.com",
+    "your_smtp_username",
+    "your_smtp_password",
+    "no-reply@example.com",
+    "example@example.com",
+  ]);
+
+  if (placeholderValues.has(String(SMTP_HOST).trim().toLowerCase())) missing.push("SMTP_HOST");
+  if (placeholderValues.has(String(SMTP_USER).trim().toLowerCase())) missing.push("SMTP_USER");
+  if (placeholderValues.has(String(SMTP_PASS).trim().toLowerCase())) missing.push("SMTP_PASS");
+  if (placeholderValues.has(String(EMAIL_FROM).trim().toLowerCase())) missing.push("EMAIL_FROM");
+
+  return missing;
+};
+
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const findAdminByUsername = async (username) => {
+  const trimmed = String(username || "").trim();
+  if (!trimmed) return null;
+
+  return AdminModel.findOne({
+    username: {
+      $regex: `^${escapeRegex(trimmed)}$`,
+      $options: "i",
+    },
+  });
+};
+
+const findCustomerByEmail = async (email) => {
+  const trimmed = String(email || "").trim();
+  if (!trimmed) return null;
+  return Customer.findOne({
+    email: {
+      $regex: `^${escapeRegex(trimmed)}$`,
+      $options: "i",
+    },
+  });
+};
+
+const sendPasswordResetTokenEmail = async ({ to, accountLabel, token }) => {
+  const missingEmailConfig = getMissingEmailConfigKeys();
+  if (missingEmailConfig.length > 0) {
+    const error = new Error(`Email service is not configured: ${missingEmailConfig.join(", ")}`);
+    error.missingConfig = missingEmailConfig;
+    throw error;
+  }
+
+  const transporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS,
+    },
+  });
+
+  const ttlMinutes = PASSWORD_RESET_TOKEN_TTL_MINUTES;
+  const subject = `Laguste ${accountLabel} password reset code`;
+  const text = [
+    `Your ${accountLabel} password reset token is: ${token}`,
+    `This token expires in ${ttlMinutes} minutes.`,
+    "If you did not request this, ignore this email.",
+  ].join("\n");
+
+  await transporter.sendMail({
+    from: EMAIL_FROM,
+    to,
+    subject,
+    text,
+  });
+};
+/* ---------------- CLOUDINARY IMAGE HELPERS ---------------- */
+
+const isCloudinaryProductImageUrl = (value) => {
+  if (typeof value !== "string") return false;
+
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+
+  if (!CLOUDINARY_CLOUD_NAME) {
+    return false;
+  }
+
+  const expectedPrefix = `https://res.cloudinary.com/${CLOUDINARY_CLOUD_NAME}/image/upload/`;
+  return trimmed.startsWith(expectedPrefix);
+};
+
+const uploadRemoteImageUrlToCloudinary = async (imageUrl) => {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const paramsToSign = `folder=${CLOUDINARY_UPLOAD_FOLDER}&timestamp=${timestamp}&transformation=${CLOUDINARY_PRODUCT_IMAGE_TRANSFORMATION}`;
+  const signature = crypto
+    .createHash("sha1")
+    .update(`${paramsToSign}${CLOUDINARY_API_SECRET}`)
+    .digest("hex");
+
+  const formData = new URLSearchParams();
+  formData.set("file", imageUrl);
+  formData.set("api_key", CLOUDINARY_API_KEY);
+  formData.set("timestamp", String(timestamp));
+  formData.set("signature", signature);
+  formData.set("folder", CLOUDINARY_UPLOAD_FOLDER);
+  formData.set("transformation", CLOUDINARY_PRODUCT_IMAGE_TRANSFORMATION);
+
+  const response = await fetch(
+    `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: formData.toString(),
+    }
+  );
+
+  const payload = await response.json();
+  if (!response.ok || !payload?.secure_url) {
+    throw new Error(payload?.error?.message || "Cloudinary migration upload failed");
+  }
+
+  return payload.secure_url;
+};
+
+const logAdminAudit = async (req, {
+  adminId = null,
+  username = "",
+  action,
+  targetType = "",
+  targetId = "",
+  status = "success",
+  details = "",
+}) => {
+  try {
+    const ip = req.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim() || req.ip || "";
+    const userAgent = req.headers["user-agent"] || "";
+
+    await AdminAuditLog.create({
+      adminId,
+      username,
+      action,
+      targetType,
+      targetId,
+      status,
+      details,
+      ip,
+      userAgent,
+    });
+  } catch (_err) {
+    // Do not block main flow if audit logging fails.
+  }
+};
+
+const requireSuperAdmin = (req, res, next) => {
+  if (req.admin?.role === "superadmin") {
+    return next();
+  }
+
+  return res.status(403).json({
+    success: false,
+    message: "Only superadmin can perform this action",
+  });
+};
+
+const requirePermission = (permission) => (req, res, next) => {
+  if (req.admin?.role === "superadmin") {
+    return next();
+  }
+
+  const permissions = Array.isArray(req.admin?.permissions)
+    ? req.admin.permissions
+    : [];
+
+  if (!permissions.includes(permission)) {
+    return res.status(403).json({
+      success: false,
+      message: `Missing required permission: ${permission}`,
+    });
+  }
+
+  return next();
+};
 
 /* ---------------- CONNECT DB ---------------- */
-const startServer = async () => {
-  try {
-    await mongoose.connect(mongoUri);
-    console.log('MongoDB connected');
+const startServer = () => {
+  app.listen(ports, () => {
+    console.log(`Server is running on port ${ports}`);
+  });
 
-    app.listen(ports, () => {
-      console.log(`Server is running on port ${ports}`);
-    });
-  } catch (err) {
-    console.error(err);
+  if (!mongoUri) {
+    console.error("MONGO_URI is not set");
+    return;
   }
+
+  mongoose
+    .connect(mongoUri)
+    .then(() => {
+      console.log("MongoDB connected");
+    })
+    .catch((err) => {
+      console.error("MongoDB connection failed", err);
+    });
 };
 
 
 /* ---------------- PRODUCTS ---------------- */
-app.get("/Products", async (req, res) => {
+app.get(["/Products", "/products", "/allproducts"], async (req, res) => {
   try {
     const products = await Products.find();
     res.json(products);
@@ -70,13 +333,22 @@ app.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    const customer = await Customer.findOne({ email });
+    const customer = await findCustomerByEmail(email);
     if (!customer) return res.status(401).json({ message: "Invalid login" });
 
     const match = await bcrypt.compare(password, customer.password);
     if (!match) return res.status(401).json({ message: "Invalid login" });
 
-    res.status(200).json({ message: "Login successful" });
+  res.status(200).json({
+  message: "Login successful",
+  user: {
+    id: customer._id,
+    first_name: customer.first_name,
+    last_name: customer.last_name,
+    email: customer.email,
+    profileImage: customer.profileImage || ""
+  }
+});
 
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -84,14 +356,22 @@ app.post('/login', async (req, res) => {
 });
 
 /* ---------------- ORDERS (FIXED) ---------------- */
-app.post("/api/orders", async (req, res) => {
+app.post(["/api/orders", "/api/orders/"], async (req, res) => {
   try {
-    const { customer, orderItems, totalAmount } = req.body;
+    const { customer, orderItems, totalAmount, user } = req.body;
+
+    const normalizedCustomer = {
+      name: customer?.name || user?.name || "",
+      email: customer?.email || user?.email || "",
+      phone: customer?.phone || "",
+      address: customer?.address || "",
+    };
 
     const newOrder = new Order({
-      customer,
+      customer: normalizedCustomer,
       orderItems,
       totalAmount,
+      user,
     });
 
     await newOrder.save();
@@ -106,6 +386,972 @@ app.post("/api/orders", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+app.get(["/api/orders", "/api/orders/"], async (req, res) => {
+  try {
+    const { phone, email } = req.query;
+    const lookup = (phone || email || "").trim();
+
+    if (!lookup) {
+      return res.status(400).json({ message: "Phone number or email address is required" });
+    }
+
+    const query = {
+      $or: [
+        { "customer.phone": lookup },
+        { "customer.email": lookup },
+        { "user.email": lookup },
+      ],
+    };
+
+    const orders = await Order.find(query).sort({ createdAt: -1 });
+
+    res.status(200).json({ orders });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+/* ---------------- GET ONE PRODUCT ---------------- */
+app.get(["/Products/:id", "/products/:id"], async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid product id" });
+    }
+
+    const product = await Products.findById(id);
+    if (!product) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    res.json(product);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+/* ================= ADMIN LOGIN ================= */
+
+app.post("/admin/login", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const normalizedUsername = String(username || "").trim();
+    const requestIp = req.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim() || req.ip || "";
+
+    if (isAdminLoginRateLimited(requestIp)) {
+      await logAdminAudit(req, {
+        username: normalizedUsername,
+        action: "admin_login",
+        status: "failure",
+        details: "Rate limit exceeded",
+      });
+
+      return res.status(429).json({
+        success: false,
+        message: "Too many login attempts from this IP. Please try again later.",
+      });
+    }
+
+    const adminUser = await findAdminByUsername(normalizedUsername);
+
+    if (!adminUser) {
+      await logAdminAudit(req, {
+        username: normalizedUsername,
+        action: "admin_login",
+        status: "failure",
+        details: "Unknown username",
+      });
+      return res.status(401).json({
+        success: false,
+        message: "Invalid username or password",
+      });
+    }
+
+    if (adminUser.lockUntil && adminUser.lockUntil > new Date()) {
+      const minutesLeft = Math.max(
+        1,
+        Math.ceil((adminUser.lockUntil.getTime() - Date.now()) / (1000 * 60))
+      );
+
+      await logAdminAudit(req, {
+        adminId: adminUser._id,
+        username: adminUser.username,
+        action: "admin_login",
+        status: "failure",
+        details: `Account locked for ${minutesLeft} more minute(s)`,
+      });
+
+      return res.status(423).json({
+        success: false,
+        message: `Account locked. Try again in ${minutesLeft} minute(s).`,
+      });
+    }
+
+    if (!adminUser.approved) {
+      await logAdminAudit(req, {
+        adminId: adminUser._id,
+        username: adminUser.username,
+        action: "admin_login",
+        status: "failure",
+        details: "Account not approved",
+      });
+      return res.status(403).json({
+        success: false,
+        message: "Your admin account is waiting for approval.",
+      });
+    }
+
+    const match = await bcrypt.compare(password, adminUser.password);
+
+    if (!match) {
+      adminUser.failedLoginAttempts = (adminUser.failedLoginAttempts || 0) + 1;
+      if (adminUser.failedLoginAttempts >= MAX_FAILED_LOGIN_ATTEMPTS) {
+        adminUser.lockUntil = new Date(Date.now() + ADMIN_LOCK_MINUTES * 60 * 1000);
+      }
+      await adminUser.save();
+
+      await logAdminAudit(req, {
+        adminId: adminUser._id,
+        username: adminUser.username,
+        action: "admin_login",
+        status: "failure",
+        details: "Invalid password",
+      });
+
+      return res.status(401).json({
+        success: false,
+        message: "Invalid username or password",
+      });
+    }
+
+    if (adminUser.failedLoginAttempts || adminUser.lockUntil) {
+      adminUser.failedLoginAttempts = 0;
+      adminUser.lockUntil = null;
+      await adminUser.save();
+    }
+
+    const token = jwt.sign(
+      {
+        id: adminUser._id,
+        username: adminUser.username,
+        role: adminUser.role,
+      },
+      process.env.JWT_SECRET,
+      {
+        expiresIn: "1d",
+      }
+    );
+
+    res.json({
+      success: true,
+      message: "Login successful",
+      token,
+      admin: {
+        id: adminUser._id,
+        first_name: adminUser.first_name,
+        last_name: adminUser.last_name,
+        username: adminUser.username,
+        email: adminUser.email,
+        role: adminUser.role,
+        permissions: adminUser.permissions || [],
+        approved: adminUser.approved,
+      },
+    });
+
+    await logAdminAudit(req, {
+      adminId: adminUser._id,
+      username: adminUser.username,
+      action: "admin_login",
+      status: "success",
+      details: "Login successful",
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+/* ================= ADMIN FORGOT/RESET PASSWORD ================= */
+
+app.post("/admin/forgot-password/request", async (req, res) => {
+  try {
+    const { username, email } = req.body;
+    const normalizedUsername = String(username || "").trim();
+
+    if (!normalizedUsername || !email) {
+      return res.status(400).json({
+        success: false,
+        message: "username and email are required",
+      });
+    }
+
+    const genericMessage = "If the account exists, a reset token has been sent to the registered email.";
+    const adminUser = await findAdminByUsername(normalizedUsername);
+
+    if (!adminUser || adminUser.email.toLowerCase() !== String(email).toLowerCase()) {
+      await logAdminAudit(req, {
+        username: normalizedUsername,
+        action: "admin_forgot_password_request",
+        status: "failure",
+        details: "Username/email mismatch",
+      });
+
+      return res.json({ success: true, message: genericMessage });
+    }
+
+    const resetToken = crypto.randomBytes(32).toString("hex");
+    const tokenHash = crypto.createHash("sha256").update(resetToken).digest("hex");
+
+    adminUser.passwordResetTokenHash = tokenHash;
+    adminUser.passwordResetTokenExpires = new Date(
+      Date.now() + PASSWORD_RESET_TOKEN_TTL_MINUTES * 60 * 1000
+    );
+    await adminUser.save();
+
+    try {
+      await sendPasswordResetTokenEmail({
+        to: adminUser.email,
+        accountLabel: "admin",
+        token: resetToken,
+      });
+    } catch (emailError) {
+      adminUser.passwordResetTokenHash = "";
+      adminUser.passwordResetTokenExpires = null;
+      await adminUser.save();
+
+      return res.status(500).json({
+        success: false,
+        message: emailError.message,
+        missingConfig: Array.isArray(emailError.missingConfig) ? emailError.missingConfig : undefined,
+      });
+    }
+
+    await logAdminAudit(req, {
+      adminId: adminUser._id,
+      username: adminUser.username,
+      action: "admin_forgot_password_request",
+      status: "success",
+      details: "Reset token generated",
+    });
+
+    return res.json({
+      success: true,
+      message: genericMessage,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+app.post("/admin/forgot-password/reset", async (req, res) => {
+  try {
+    const { username, token, newPassword } = req.body;
+    const normalizedUsername = String(username || "").trim();
+
+    if (!normalizedUsername || !token || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: "username, token and newPassword are required",
+      });
+    }
+
+    if (!isStrongPassword(newPassword)) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 8 chars and include uppercase, lowercase, number and special character",
+      });
+    }
+
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const adminUser = await findAdminByUsername(normalizedUsername);
+
+    if (
+      !adminUser ||
+      adminUser.passwordResetTokenHash !== tokenHash ||
+      !adminUser.passwordResetTokenExpires ||
+      adminUser.passwordResetTokenExpires <= new Date()
+    ) {
+      await logAdminAudit(req, {
+        username: normalizedUsername,
+        action: "admin_forgot_password_reset",
+        status: "failure",
+        details: "Invalid/expired reset token",
+      });
+
+      return res.status(400).json({
+        success: false,
+        message: "Invalid or expired reset token",
+      });
+    }
+
+    adminUser.password = await bcrypt.hash(newPassword, 10);
+    adminUser.passwordResetTokenHash = "";
+    adminUser.passwordResetTokenExpires = null;
+    adminUser.failedLoginAttempts = 0;
+    adminUser.lockUntil = null;
+    await adminUser.save();
+
+    await logAdminAudit(req, {
+      adminId: adminUser._id,
+      username: adminUser.username,
+      action: "admin_forgot_password_reset",
+      status: "success",
+      details: "Password reset successful",
+    });
+
+    return res.json({
+      success: true,
+      message: "Password reset successfully",
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+/* ================= CUSTOMER FORGOT/RESET PASSWORD ================= */
+
+app.post("/forgot-password/request", async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: "email is required",
+      });
+    }
+
+    const genericMessage = "If the account exists, a reset token has been sent to the registered email.";
+    const customer = await findCustomerByEmail(email);
+
+    if (!customer) {
+      return res.json({ success: true, message: genericMessage });
+    }
+
+    const resetToken = crypto.randomBytes(32).toString("hex");
+    const tokenHash = crypto.createHash("sha256").update(resetToken).digest("hex");
+
+    customer.passwordResetTokenHash = tokenHash;
+    customer.passwordResetTokenExpires = new Date(
+      Date.now() + PASSWORD_RESET_TOKEN_TTL_MINUTES * 60 * 1000
+    );
+    await customer.save();
+
+    try {
+      await sendPasswordResetTokenEmail({
+        to: customer.email,
+        accountLabel: "customer",
+        token: resetToken,
+      });
+    } catch (emailError) {
+      customer.passwordResetTokenHash = "";
+      customer.passwordResetTokenExpires = null;
+      await customer.save();
+
+      return res.status(500).json({
+        success: false,
+        message: emailError.message,
+        missingConfig: Array.isArray(emailError.missingConfig) ? emailError.missingConfig : undefined,
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: genericMessage,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+app.post("/forgot-password/reset", async (req, res) => {
+  try {
+    const { email, token, newPassword } = req.body;
+
+    if (!email || !token || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: "email, token and newPassword are required",
+      });
+    }
+
+    if (!isStrongPassword(newPassword)) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 8 chars and include uppercase, lowercase, number and special character",
+      });
+    }
+
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const customer = await findCustomerByEmail(email);
+
+    if (
+      !customer ||
+      customer.passwordResetTokenHash !== tokenHash ||
+      !customer.passwordResetTokenExpires ||
+      customer.passwordResetTokenExpires <= new Date()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid or expired reset token",
+      });
+    }
+
+    customer.password = await bcrypt.hash(newPassword, 10);
+    customer.passwordResetTokenHash = "";
+    customer.passwordResetTokenExpires = null;
+    await customer.save();
+
+    return res.json({
+      success: true,
+      message: "Password reset successfully",
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+/* ================= ADD ADMIN (SUPERADMIN ONLY) ================= */
+
+app.post("/admin/add-admin", adminAuth, requirePermission("add_admin"), async (req, res) => {
+  try {
+    const {
+      first_name,
+      last_name,
+      username,
+      email,
+      password,
+      role,
+      permissions,
+      approved,
+    } = req.body;
+
+    if (!first_name || !last_name || !username || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "first_name, last_name, username, email and password are required",
+      });
+    }
+
+    if (!isStrongPassword(password)) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 8 chars and include uppercase, lowercase, number and special character",
+      });
+    }
+
+    const existingUser = await AdminModel.findOne({
+      $or: [{ username }, { email }],
+    });
+
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        message: "Admin with username or email already exists",
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const normalizedRole = role === "superadmin" ? "superadmin" : "admin";
+    const selectedPermissions = Array.isArray(permissions)
+      ? permissions.filter((permission) => ALL_ADMIN_PERMISSIONS.includes(permission))
+      : [];
+
+    const admin = await AdminModel.create({
+      first_name,
+      last_name,
+      username,
+      email,
+      password: hashedPassword,
+      role: normalizedRole,
+      permissions:
+        normalizedRole === "superadmin" ? ALL_ADMIN_PERMISSIONS : selectedPermissions,
+      approved: typeof approved === "boolean" ? approved : true,
+    });
+
+    await logAdminAudit(req, {
+      adminId: req.admin.id,
+      username: req.admin.username,
+      action: "admin_create",
+      targetType: "admin",
+      targetId: admin._id.toString(),
+      status: "success",
+      details: `Created admin ${admin.username}`,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "Admin created successfully",
+      admin: {
+        id: admin._id,
+        first_name: admin.first_name,
+        last_name: admin.last_name,
+        username: admin.username,
+        email: admin.email,
+        role: admin.role,
+        permissions: admin.permissions,
+        approved: admin.approved,
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+/* ================= GET ALL ORDERS ================= */
+
+app.get("/admin/orders", adminAuth, requirePermission("manage_orders"), async (req, res) => {
+  try {
+    const orders = await Order.find().sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      orders,
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+
+/* ================= APPROVE / UPDATE ORDER ================= */
+
+app.put("/admin/orders/:id", adminAuth, requirePermission("manage_orders"), async (req, res) => {
+  try {
+    const nextStatus = req.body.status;
+    const updateDoc = { status: nextStatus };
+
+    if (nextStatus === "Approved") {
+      const actingAdmin = await AdminModel.findById(req.admin.id).select("username email");
+      updateDoc.approvedBy = {
+        id: req.admin.id,
+        username: actingAdmin?.username || req.admin.username,
+        email: actingAdmin?.email || "",
+        at: new Date(),
+      };
+    } else {
+      updateDoc.approvedBy = null;
+    }
+
+    const updatedOrder = await Order.findByIdAndUpdate(
+      req.params.id,
+      updateDoc,
+      {
+        new: true,
+      }
+    );
+
+    res.json({
+      success: true,
+      order: updatedOrder,
+    });
+
+    await logAdminAudit(req, {
+      adminId: req.admin.id,
+      username: req.admin.username,
+      action: "order_status_update",
+      targetType: "order",
+      targetId: req.params.id,
+      status: "success",
+      details: `Set status to ${nextStatus}`,
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+/* ================= ADMIN ACTIVITY (SUPERADMIN ONLY) ================= */
+
+app.get("/admin/admin-activity", adminAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    const admins = await AdminModel.find({}, "first_name last_name username email role permissions approved createdAt").sort({ createdAt: -1 }).lean();
+
+    const adminsWithActivity = await Promise.all(
+      admins.map(async (admin) => {
+        const approvedOrders = await Order.find(
+          {
+            status: "Approved",
+            "approvedBy.id": admin._id.toString(),
+          },
+          "_id totalAmount customer status approvedBy createdAt updatedAt"
+        )
+          .sort({ updatedAt: -1 })
+          .lean();
+
+        return {
+          ...admin,
+          approvedOrdersCount: approvedOrders.length,
+          approvedOrders,
+        };
+      })
+    );
+
+    return res.json({
+      success: true,
+      admins: adminsWithActivity,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+/* ================= ADMIN MANAGEMENT (SUPERADMIN ONLY) ================= */
+
+app.get("/admin/admins", adminAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    const admins = await AdminModel.find(
+      {},
+      "first_name last_name username email role permissions approved createdAt"
+    )
+      .sort({ createdAt: -1 })
+      .lean();
+
+    return res.json({
+      success: true,
+      admins,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+app.put("/admin/admins/:id", adminAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    const targetAdmin = await AdminModel.findById(req.params.id);
+    if (!targetAdmin) {
+      return res.status(404).json({
+        success: false,
+        message: "Admin not found",
+      });
+    }
+
+    const { role, permissions, approved } = req.body;
+    const normalizedRole = role === "superadmin" ? "superadmin" : "admin";
+    const selectedPermissions = Array.isArray(permissions)
+      ? permissions.filter((permission) => ALL_ADMIN_PERMISSIONS.includes(permission))
+      : [];
+
+    targetAdmin.role = normalizedRole;
+    targetAdmin.permissions =
+      normalizedRole === "superadmin" ? ALL_ADMIN_PERMISSIONS : selectedPermissions;
+
+    if (typeof approved === "boolean") {
+      targetAdmin.approved = approved;
+    }
+
+    await targetAdmin.save();
+
+    await logAdminAudit(req, {
+      adminId: req.admin.id,
+      username: req.admin.username,
+      action: "admin_update",
+      targetType: "admin",
+      targetId: targetAdmin._id.toString(),
+      status: "success",
+      details: `Updated role=${targetAdmin.role}, approved=${targetAdmin.approved}`,
+    });
+
+    return res.json({
+      success: true,
+      message: "Admin updated successfully",
+      admin: {
+        id: targetAdmin._id,
+        first_name: targetAdmin.first_name,
+        last_name: targetAdmin.last_name,
+        username: targetAdmin.username,
+        email: targetAdmin.email,
+        role: targetAdmin.role,
+        permissions: targetAdmin.permissions,
+        approved: targetAdmin.approved,
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+app.get("/admin/audit-logs", adminAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 100, 500);
+    const logs = await AdminAuditLog.find({})
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    return res.json({
+      success: true,
+      logs,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+
+/* ================= GET ALL PRODUCTS ================= */
+
+app.get("/admin/products", adminAuth, requirePermission("manage_products"), async (req, res) => {
+  try {
+    const products = await Products.find();
+
+    res.json({
+      success: true,
+      products,
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+/* ================= CLOUDINARY SIGNED UPLOAD ================= */
+
+app.post("/admin/cloudinary/sign-upload", adminAuth, requirePermission("add_product"), async (req, res) => {
+  try {
+    const missingConfig = getMissingCloudinaryConfigKeys();
+    if (missingConfig.length > 0) {
+      return res.status(500).json({
+        success: false,
+        message: "Cloudinary server configuration is incomplete",
+        missingConfig,
+      });
+    }
+
+    const timestamp = Math.floor(Date.now() / 1000);
+    const paramsToSign = `folder=${CLOUDINARY_UPLOAD_FOLDER}&timestamp=${timestamp}&transformation=${CLOUDINARY_PRODUCT_IMAGE_TRANSFORMATION}`;
+    const signature = crypto
+      .createHash("sha1")
+      .update(`${paramsToSign}${CLOUDINARY_API_SECRET}`)
+      .digest("hex");
+
+    await logAdminAudit(req, {
+      adminId: req.admin.id,
+      username: req.admin.username,
+      action: "cloudinary_upload_signature",
+      targetType: "cloudinary",
+      status: "success",
+      details: `Generated signed upload parameters for folder ${CLOUDINARY_UPLOAD_FOLDER}`,
+    });
+
+    return res.json({
+      success: true,
+      cloudName: CLOUDINARY_CLOUD_NAME,
+      apiKey: CLOUDINARY_API_KEY,
+      folder: CLOUDINARY_UPLOAD_FOLDER,
+      transformation: CLOUDINARY_PRODUCT_IMAGE_TRANSFORMATION,
+      timestamp,
+      signature,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+
+/* ================= ADD PRODUCT ================= */
+
+app.post("/admin/products", adminAuth, requirePermission("add_product"), async (req, res) => {
+  try {
+    if (!isCloudinaryProductImageUrl(req.body?.img)) {
+      return res.status(400).json({
+        success: false,
+        message: "Product image must be uploaded to Cloudinary before saving",
+      });
+    }
+
+    const product = new Products(req.body);
+    await product.save();
+    res.status(201).json({
+      success: true,
+      product,
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+
+/* ================= EDIT PRODUCT ================= */
+
+app.put("/admin/products/:id", adminAuth, requirePermission("manage_products"), async (req, res) => {
+  try {
+    if (typeof req.body?.img !== "undefined" && !isCloudinaryProductImageUrl(req.body.img)) {
+      return res.status(400).json({
+        success: false,
+        message: "Product image must be a Cloudinary URL",
+      });
+    }
+
+    const updatedProduct = await Products.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      {
+        new: true,
+      }
+    );
+    res.json({
+      success: true,
+      product: updatedProduct,
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+app.post("/admin/products/migrate-images-to-cloudinary", adminAuth, requirePermission("manage_products"), async (req, res) => {
+  try {
+    const missingConfig = getMissingCloudinaryConfigKeys();
+    if (missingConfig.length > 0) {
+      return res.status(500).json({
+        success: false,
+        message: "Cloudinary server configuration is incomplete",
+        missingConfig,
+      });
+    }
+
+    const products = await Products.find({});
+    const migrated = [];
+    const skipped = [];
+    const failed = [];
+
+    for (const product of products) {
+      const currentImage = String(product.img || "").trim();
+
+      if (!currentImage) {
+        skipped.push({ productId: product._id.toString(), reason: "Missing image" });
+        continue;
+      }
+
+      if (isCloudinaryProductImageUrl(currentImage)) {
+        skipped.push({ productId: product._id.toString(), reason: "Already Cloudinary" });
+        continue;
+      }
+
+      if (!/^https?:\/\//i.test(currentImage)) {
+        skipped.push({
+          productId: product._id.toString(),
+          reason: "Not a public URL (likely local asset key)",
+          image: currentImage,
+        });
+        continue;
+      }
+
+      try {
+        const secureUrl = await uploadRemoteImageUrlToCloudinary(currentImage);
+        product.img = secureUrl;
+        await product.save();
+
+        migrated.push({
+          productId: product._id.toString(),
+          from: currentImage,
+          to: secureUrl,
+        });
+      } catch (migrationError) {
+        failed.push({
+          productId: product._id.toString(),
+          image: currentImage,
+          reason: migrationError.message,
+        });
+      }
+    }
+
+    await logAdminAudit(req, {
+      adminId: req.admin.id,
+      username: req.admin.username,
+      action: "product_image_migration_to_cloudinary",
+      targetType: "product",
+      status: failed.length > 0 ? "failure" : "success",
+      details: `Migrated=${migrated.length}, Skipped=${skipped.length}, Failed=${failed.length}`,
+    });
+
+    return res.json({
+      success: true,
+      summary: {
+        totalProducts: products.length,
+        migrated: migrated.length,
+        skipped: skipped.length,
+        failed: failed.length,
+      },
+      migrated,
+      skipped,
+      failed,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+
+/* ================= DELETE PRODUCT ================= */
+
+app.delete("/admin/products/:id", adminAuth, requirePermission("manage_products"), async (req, res) => {
+  try {
+    await Products.findByIdAndDelete(req.params.id);
+
+    res.json({
+      success: true,
+      message: "Product deleted successfully",
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
 
 /* ---------------- START SERVER ---------------- */
 startServer();
