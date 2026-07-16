@@ -38,6 +38,27 @@ const orderSchema = new mongoose.Schema(
       email: String,
       at: Date,
     },
+
+    invoice: {
+      invoiceNumber: String,
+      postedAt: Date,
+      postedBy: {
+        id: String,
+        username: String,
+        email: String,
+      },
+      items: [
+        {
+          productId: String,
+          name: String,
+          quantity: Number,
+          unitPrice: Number,
+          lineTotal: Number,
+        },
+      ],
+      totalQuantity: Number,
+      totalAmount: Number,
+    },
   },
   { timestamps: true }
 );

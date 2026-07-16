@@ -10,6 +10,7 @@ const jwt = require("jsonwebtoken");
 const Products = require('./models/Products');
 const Customer = require('./models/customers');
 const Order = require('./models/orders'); // FIXED NAME
+const Invoice = require('./models/invoices');
 const adminAuth = require("./middleware/adminAuths");
 const AdminModel = require("./models/admin");
 const AdminAuditLog = require("./models/adminAuditLog");
@@ -46,6 +47,79 @@ const SMTP_PASS = process.env.SMTP_PASS || "";
 const SMTP_SECURE = String(process.env.SMTP_SECURE || "false").toLowerCase() === "true";
 const EMAIL_FROM = process.env.EMAIL_FROM || SMTP_USER;
 const adminLoginRateMap = new Map();
+
+const generateInvoiceNumber = () => {
+  const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const randomPart = crypto.randomBytes(3).toString("hex").toUpperCase();
+  return `INV-${stamp}-${randomPart}`;
+};
+
+const generateReceiptNumber = () => {
+  const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const randomPart = crypto.randomBytes(3).toString("hex").toUpperCase();
+  return `REC-${stamp}-${randomPart}`;
+};
+
+const buildInvoiceItemsFromRequest = async (rawItems) => {
+  if (!Array.isArray(rawItems) || rawItems.length === 0) {
+    throw new Error("Invoice must contain at least one item");
+  }
+
+  const invoiceItems = [];
+  let totalQuantity = 0;
+  let totalAmount = 0;
+
+  for (const rawItem of rawItems) {
+    const productId = String(rawItem?.productId || rawItem?._id || "").trim();
+    const quantity = Number(rawItem?.quantity ?? rawItem?.cartQuantity ?? 0);
+
+    if (!mongoose.Types.ObjectId.isValid(productId)) {
+      throw new Error(`Invalid product id for invoice item ${rawItem?.name || "unknown"}`);
+    }
+
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      throw new Error(`Invalid quantity for invoice item ${rawItem?.name || productId}`);
+    }
+
+    const product = await Products.findById(productId);
+
+    if (!product) {
+      throw new Error(`Product not found for invoice item ${rawItem?.name || productId}`);
+    }
+
+    if (Number(product.stock || 0) < quantity) {
+      throw new Error(`Insufficient stock for ${product.name}. Available: ${product.stock || 0}`);
+    }
+
+    const unitPrice = Number(rawItem?.unitPrice ?? rawItem?.price ?? product.price ?? 0);
+    const lineTotal = unitPrice * quantity;
+
+    invoiceItems.push({
+      productId: product._id.toString(),
+      name: rawItem?.name || product.name,
+      quantity,
+      unitPrice,
+      lineTotal,
+    });
+
+    totalQuantity += quantity;
+    totalAmount += lineTotal;
+  }
+
+  return {
+    invoiceItems,
+    totalQuantity,
+    totalAmount,
+  };
+};
+
+const decrementInvoiceStock = async (invoiceItems) => {
+  for (const invoiceItem of invoiceItems) {
+    await Products.findByIdAndUpdate(invoiceItem.productId, {
+      $inc: { stock: -invoiceItem.quantity },
+    });
+  }
+};
 
 const getMissingCloudinaryConfigKeys = () => {
   const missing = [];
@@ -409,6 +483,49 @@ app.get(["/api/orders", "/api/orders/"], async (req, res) => {
     res.status(200).json({ orders });
   } catch (error) {
     res.status(500).json({ message: error.message });
+  }
+});
+/* ---------------- DELETE ORDER (FIXED) ---------------- */
+app.delete(["/api/orders/:id", "/api/orders/:id/"], async (req, res) => {
+  try {
+    const { id } = req.params;
+    const requesterEmail = String(req.body?.email || "").trim().toLowerCase();
+    const pendingStatuses = new Set(["pending", "processing", "approved"]);
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid order id" });
+    }
+
+    if (!requesterEmail) {
+      return res.status(400).json({ message: "Customer email is required" });
+    }
+
+    const order = await Order.findById(id);
+
+    if (!order) {
+      return res.status(404).json({ message: "Order not found" });
+    }
+
+    const orderCustomerEmail = String(order.customer?.email || "").trim().toLowerCase();
+    const orderUserEmail = String(order.user?.email || "").trim().toLowerCase();
+    const normalizedStatus = String(order.status || "pending").trim().toLowerCase();
+
+    if (requesterEmail !== orderCustomerEmail && requesterEmail !== orderUserEmail) {
+      return res.status(403).json({ message: "You can only delete your own orders" });
+    }
+
+    if (!pendingStatuses.has(normalizedStatus)) {
+      return res.status(403).json({ message: "Only pending orders can be deleted" });
+    }
+
+    await Order.findByIdAndDelete(id);
+
+    return res.status(200).json({
+      success: true,
+      message: "Order deleted successfully",
+    });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
   }
 });
 
@@ -980,6 +1097,267 @@ app.put("/admin/orders/:id", adminAuth, requirePermission("manage_orders"), asyn
     });
   } catch (err) {
     res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+app.post("/admin/orders/:id/invoice", adminAuth, requirePermission("manage_orders"), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const requestedInvoiceNumber = String(req.body?.invoiceNumber || "").trim();
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid order id",
+      });
+    }
+
+    const order = await Order.findById(id);
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    if (order.invoice?.invoiceNumber) {
+      return res.status(409).json({
+        success: false,
+        message: "Invoice has already been posted for this order",
+      });
+    }
+
+    if (String(order.status || "").trim() !== "Approved") {
+      return res.status(400).json({
+        success: false,
+        message: "Only approved orders can be invoiced",
+      });
+    }
+
+    const invoiceItems = [];
+    let totalQuantity = 0;
+
+    for (const item of order.orderItems || []) {
+      const quantity = Number(item.cartQuantity ?? item.quantity ?? 0);
+      const unitPrice = Number(item.price || 0);
+
+      if (quantity <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid quantity for product ${item.name || item._id || "unknown"}`,
+        });
+      }
+
+      if (!mongoose.Types.ObjectId.isValid(String(item._id || ""))) {
+        return res.status(400).json({
+          success: false,
+          message: `Order item ${item.name || "unknown"} is missing a valid product id`,
+        });
+      }
+
+      const product = await Products.findById(item._id);
+
+      if (!product) {
+        return res.status(404).json({
+          success: false,
+          message: `Product not found for order item ${item.name || item._id}`,
+        });
+      }
+
+      if (Number(product.stock || 0) < quantity) {
+        return res.status(400).json({
+          success: false,
+          message: `Insufficient stock for ${product.name}. Available: ${product.stock || 0}`,
+        });
+      }
+
+      invoiceItems.push({
+        productId: product._id.toString(),
+        name: item.name || product.name,
+        quantity,
+        unitPrice,
+        lineTotal: unitPrice * quantity,
+      });
+      totalQuantity += quantity;
+    }
+
+    for (const invoiceItem of invoiceItems) {
+      await Products.findByIdAndUpdate(invoiceItem.productId, {
+        $inc: { stock: -invoiceItem.quantity },
+      });
+    }
+
+    order.invoice = {
+      invoiceNumber: requestedInvoiceNumber || generateInvoiceNumber(),
+      postedAt: new Date(),
+      postedBy: {
+        id: req.admin.id,
+        username: req.admin.username,
+        email: req.admin.email,
+      },
+      items: invoiceItems,
+      totalQuantity,
+      totalAmount: Number(order.totalAmount || 0),
+    };
+
+    await order.save();
+
+    await logAdminAudit(req, {
+      adminId: req.admin.id,
+      username: req.admin.username,
+      action: "order_invoice_post",
+      targetType: "order",
+      targetId: order._id.toString(),
+      status: "success",
+      details: `Posted invoice ${order.invoice.invoiceNumber}`,
+    });
+
+    return res.json({
+      success: true,
+      message: "Invoice posted successfully",
+      order,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+app.get("/admin/invoices", adminAuth, requirePermission("manage_orders"), async (req, res) => {
+  try {
+    const invoices = await Invoice.find({}).sort({ postedAt: -1, createdAt: -1 }).lean();
+
+    return res.json({
+      success: true,
+      invoices,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+app.post("/admin/invoices", adminAuth, requirePermission("manage_orders"), async (req, res) => {
+  try {
+    const requestedInvoiceNumber = String(req.body?.invoiceNumber || "").trim();
+    const sourceOrderId = String(req.body?.sourceOrderId || "").trim();
+    const customerPayload = req.body?.customer || {};
+    const providedItems = Array.isArray(req.body?.items) ? req.body.items : [];
+
+    let sourceOrder = null;
+
+    if (sourceOrderId) {
+      if (!mongoose.Types.ObjectId.isValid(sourceOrderId)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid source order id",
+        });
+      }
+
+      sourceOrder = await Order.findById(sourceOrderId);
+
+      if (!sourceOrder) {
+        return res.status(404).json({
+          success: false,
+          message: "Source order not found",
+        });
+      }
+
+      if (sourceOrder.invoice?.invoiceNumber) {
+        return res.status(409).json({
+          success: false,
+          message: "An invoice has already been posted for this order",
+        });
+      }
+    }
+
+    const invoiceNumber = requestedInvoiceNumber || generateInvoiceNumber();
+    const existingInvoice = await Invoice.findOne({ invoiceNumber });
+
+    if (existingInvoice) {
+      return res.status(409).json({
+        success: false,
+        message: "Invoice number already exists",
+      });
+    }
+
+    const resolvedCustomer = {
+      name: String(customerPayload.name || sourceOrder?.customer?.name || sourceOrder?.user?.name || "").trim(),
+      email: String(customerPayload.email || sourceOrder?.customer?.email || sourceOrder?.user?.email || "").trim(),
+      phone: String(customerPayload.phone || sourceOrder?.customer?.phone || "").trim(),
+      address: String(customerPayload.address || sourceOrder?.customer?.address || "").trim(),
+    };
+
+    const fallbackOrderItems = (sourceOrder?.orderItems || []).map((item) => ({
+      productId: item._id,
+      name: item.name,
+      quantity: item.cartQuantity ?? item.quantity ?? 0,
+      unitPrice: item.price,
+    }));
+
+    const rawItems = providedItems.length > 0 ? providedItems : fallbackOrderItems;
+    const { invoiceItems, totalQuantity, totalAmount } = await buildInvoiceItemsFromRequest(rawItems);
+
+    await decrementInvoiceStock(invoiceItems);
+
+    const invoice = await Invoice.create({
+      invoiceNumber,
+      sourceOrderId: sourceOrder?._id?.toString() || "",
+      sourceType: sourceOrder ? "order" : "manual",
+      customer: resolvedCustomer,
+      items: invoiceItems,
+      totalQuantity,
+      totalAmount,
+      postedBy: {
+        id: req.admin.id,
+        username: req.admin.username,
+        email: req.admin.email,
+      },
+      postedAt: new Date(),
+      receipt: {
+        receiptNumber: generateReceiptNumber(),
+        issuedAt: new Date(),
+      },
+    });
+
+    if (sourceOrder) {
+      sourceOrder.invoice = {
+        invoiceNumber: invoice.invoiceNumber,
+        postedAt: invoice.postedAt,
+        postedBy: invoice.postedBy,
+        items: invoiceItems,
+        totalQuantity,
+        totalAmount,
+      };
+
+      await sourceOrder.save();
+    }
+
+    await logAdminAudit(req, {
+      adminId: req.admin.id,
+      username: req.admin.username,
+      action: "invoice_post",
+      targetType: "invoice",
+      targetId: invoice._id.toString(),
+      status: "success",
+      details: `Posted invoice ${invoice.invoiceNumber}`,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "Invoice posted successfully",
+      invoice,
+    });
+  } catch (err) {
+    return res.status(500).json({
       success: false,
       message: err.message,
     });
