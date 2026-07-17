@@ -16,8 +16,30 @@ const invoiceSchema = new mongoose.Schema(
 
     sourceType: {
       type: String,
-      enum: ["manual", "order"],
+      enum: ["manual", "order", "supplier"],
       default: "manual",
+    },
+
+    inventoryAction: {
+      type: String,
+      enum: ["out", "in"],
+      default: "out",
+    },
+
+    invoiceDate: {
+      type: Date,
+      default: Date.now,
+    },
+
+    supplier: {
+      name: {
+        type: String,
+        default: "",
+      },
+      contact: {
+        type: String,
+        default: "",
+      },
     },
 
     customer: {

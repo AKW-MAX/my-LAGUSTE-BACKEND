@@ -60,7 +60,23 @@ const generateReceiptNumber = () => {
   return `REC-${stamp}-${randomPart}`;
 };
 
-const buildInvoiceItemsFromRequest = async (rawItems) => {
+const resolveProductStock = (product) => {
+  const stockValue = Number(product?.stock);
+  if (Number.isFinite(stockValue)) {
+    return stockValue;
+  }
+
+  const legacyQuantity = Number(product?.get?.("quantity"));
+  if (Number.isFinite(legacyQuantity)) {
+    return legacyQuantity;
+  }
+
+  return 0;
+};
+
+const buildInvoiceItemsFromRequest = async (rawItems, options = {}) => {
+  const inventoryAction = options.inventoryAction === "in" ? "in" : "out";
+
   if (!Array.isArray(rawItems) || rawItems.length === 0) {
     throw new Error("Invoice must contain at least one item");
   }
@@ -87,8 +103,10 @@ const buildInvoiceItemsFromRequest = async (rawItems) => {
       throw new Error(`Product not found for invoice item ${rawItem?.name || productId}`);
     }
 
-    if (Number(product.stock || 0) < quantity) {
-      throw new Error(`Insufficient stock for ${product.name}. Available: ${product.stock || 0}`);
+    const availableStock = resolveProductStock(product);
+
+    if (inventoryAction === "out" && availableStock < quantity) {
+      throw new Error(`Insufficient stock for ${product.name}. Available: ${availableStock}`);
     }
 
     const unitPrice = Number(rawItem?.unitPrice ?? rawItem?.price ?? product.price ?? 0);
@@ -119,6 +137,36 @@ const decrementInvoiceStock = async (invoiceItems) => {
       $inc: { stock: -invoiceItem.quantity },
     });
   }
+};
+
+const applyInvoiceStockMovement = async (invoiceItems, inventoryAction) => {
+  const movement = inventoryAction === "in" ? 1 : -1;
+
+  for (const invoiceItem of invoiceItems) {
+    await Products.findByIdAndUpdate(invoiceItem.productId, {
+      $inc: { stock: movement * invoiceItem.quantity },
+    });
+  }
+};
+
+const mapInvoiceErrorStatus = (message) => {
+  const text = String(message || "").toLowerCase();
+
+  if (
+    text.includes("invoice must contain at least one item") ||
+    text.includes("invalid product id") ||
+    text.includes("invalid quantity") ||
+    text.includes("insufficient stock") ||
+    text.includes("supplier name is required")
+  ) {
+    return 400;
+  }
+
+  if (text.includes("product not found")) {
+    return 404;
+  }
+
+  return 500;
 };
 
 const getMissingCloudinaryConfigKeys = () => {
@@ -1144,6 +1192,7 @@ app.post("/admin/orders/:id/invoice", adminAuth, requirePermission("manage_order
     for (const item of order.orderItems || []) {
       const quantity = Number(item.cartQuantity ?? item.quantity ?? 0);
       const unitPrice = Number(item.price || 0);
+      const orderItemProductId = String(item._id || item.productId || "").trim();
 
       if (quantity <= 0) {
         return res.status(400).json({
@@ -1152,14 +1201,14 @@ app.post("/admin/orders/:id/invoice", adminAuth, requirePermission("manage_order
         });
       }
 
-      if (!mongoose.Types.ObjectId.isValid(String(item._id || ""))) {
+      if (!mongoose.Types.ObjectId.isValid(orderItemProductId)) {
         return res.status(400).json({
           success: false,
           message: `Order item ${item.name || "unknown"} is missing a valid product id`,
         });
       }
 
-      const product = await Products.findById(item._id);
+      const product = await Products.findById(orderItemProductId);
 
       if (!product) {
         return res.status(404).json({
@@ -1168,10 +1217,12 @@ app.post("/admin/orders/:id/invoice", adminAuth, requirePermission("manage_order
         });
       }
 
-      if (Number(product.stock || 0) < quantity) {
+      const availableStock = resolveProductStock(product);
+
+      if (availableStock < quantity) {
         return res.status(400).json({
           success: false,
-          message: `Insufficient stock for ${product.name}. Available: ${product.stock || 0}`,
+          message: `Insufficient stock for ${product.name}. Available: ${availableStock}`,
         });
       }
 
@@ -1245,10 +1296,33 @@ app.get("/admin/invoices", adminAuth, requirePermission("manage_orders"), async 
   }
 });
 
+app.get("/admin/supplier-invoices", adminAuth, requirePermission("manage_orders"), async (req, res) => {
+  try {
+    const invoices = await Invoice.find({ sourceType: "supplier" })
+      .sort({ invoiceDate: -1, postedAt: -1, createdAt: -1 })
+      .lean();
+
+    return res.json({
+      success: true,
+      invoices,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
 app.post("/admin/invoices", adminAuth, requirePermission("manage_orders"), async (req, res) => {
   try {
     const requestedInvoiceNumber = String(req.body?.invoiceNumber || "").trim();
     const sourceOrderId = String(req.body?.sourceOrderId || "").trim();
+    const requestedSourceType = String(req.body?.sourceType || "").trim().toLowerCase();
+    const sourceType = requestedSourceType === "supplier" ? "supplier" : "manual";
+    const supplierPayload = req.body?.supplier || {};
+    const parsedInvoiceDate = req.body?.invoiceDate ? new Date(req.body.invoiceDate) : new Date();
+    const invoiceDate = Number.isNaN(parsedInvoiceDate.getTime()) ? new Date() : parsedInvoiceDate;
     const customerPayload = req.body?.customer || {};
     const providedItems = Array.isArray(req.body?.items) ? req.body.items : [];
 
@@ -1279,6 +1353,9 @@ app.post("/admin/invoices", adminAuth, requirePermission("manage_orders"), async
       }
     }
 
+    const normalizedSourceType = sourceOrder ? "order" : sourceType;
+    const inventoryAction = normalizedSourceType === "supplier" ? "in" : "out";
+
     const invoiceNumber = requestedInvoiceNumber || generateInvoiceNumber();
     const existingInvoice = await Invoice.findOne({ invoiceNumber });
 
@@ -1296,22 +1373,39 @@ app.post("/admin/invoices", adminAuth, requirePermission("manage_orders"), async
       address: String(customerPayload.address || sourceOrder?.customer?.address || "").trim(),
     };
 
+    const resolvedSupplier = {
+      name: String(supplierPayload.name || "").trim(),
+      contact: String(supplierPayload.contact || "").trim(),
+    };
+
+    if (normalizedSourceType === "supplier" && !resolvedSupplier.name) {
+      return res.status(400).json({
+        success: false,
+        message: "Supplier name is required for supplier invoices",
+      });
+    }
+
     const fallbackOrderItems = (sourceOrder?.orderItems || []).map((item) => ({
-      productId: item._id,
+      productId: item._id || item.productId,
       name: item.name,
       quantity: item.cartQuantity ?? item.quantity ?? 0,
       unitPrice: item.price,
     }));
 
     const rawItems = providedItems.length > 0 ? providedItems : fallbackOrderItems;
-    const { invoiceItems, totalQuantity, totalAmount } = await buildInvoiceItemsFromRequest(rawItems);
+    const { invoiceItems, totalQuantity, totalAmount } = await buildInvoiceItemsFromRequest(rawItems, {
+      inventoryAction,
+    });
 
-    await decrementInvoiceStock(invoiceItems);
+    await applyInvoiceStockMovement(invoiceItems, inventoryAction);
 
     const invoice = await Invoice.create({
       invoiceNumber,
       sourceOrderId: sourceOrder?._id?.toString() || "",
-      sourceType: sourceOrder ? "order" : "manual",
+      sourceType: normalizedSourceType,
+      inventoryAction,
+      invoiceDate,
+      supplier: resolvedSupplier,
       customer: resolvedCustomer,
       items: invoiceItems,
       totalQuantity,
@@ -1357,7 +1451,8 @@ app.post("/admin/invoices", adminAuth, requirePermission("manage_orders"), async
       invoice,
     });
   } catch (err) {
-    return res.status(500).json({
+    const status = mapInvoiceErrorStatus(err?.message);
+    return res.status(status).json({
       success: false,
       message: err.message,
     });
