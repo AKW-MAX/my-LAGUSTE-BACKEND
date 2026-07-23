@@ -1805,6 +1805,43 @@ app.post("/admin/products/migrate-images-to-cloudinary", adminAuth, requirePermi
     });
   }
 });
+app.put(
+  "/admin/products/:id",
+  adminAuth,
+  requirePermission("manage_products"),
+  async (req, res) => {
+    try {
+      const updatedProduct = await Products.findByIdAndUpdate(
+        req.params.id,
+        req.body,
+        {
+          new: true,
+          runValidators: true,
+        }
+      );
+
+      if (!updatedProduct) {
+        return res.status(404).json({
+          success: false,
+          message: "Product not found",
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: "Product updated successfully",
+        product: updatedProduct,
+      });
+    } catch (err) {
+      console.error("Update product error:", err);
+
+      return res.status(500).json({
+        success: false,
+        message: err.message,
+      });
+    }
+  }
+);
 
 
 /* ================= DELETE PRODUCT ================= */
