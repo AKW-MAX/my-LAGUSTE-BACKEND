@@ -26,6 +26,11 @@ const ALL_ADMIN_PERMISSIONS = [
   "manage_products",
   "add_product",
   "add_admin",
+  "post_invoices",
+  "audit_logs",
+  "admin_activity",
+  "edit_admin_permissions",
+  "sale_receipts",
 ];
 const MAX_FAILED_LOGIN_ATTEMPTS = 5;
 const ADMIN_LOCK_MINUTES = 15;
@@ -778,8 +783,9 @@ app.post("/admin/forgot-password/request", async (req, res) => {
     await adminUser.save();
 
     try {
+      const recipientEmail = adminUser.email || process.env.OWNER_EMAIL || SMTP_USER || EMAIL_FROM;
       await sendPasswordResetTokenEmail({
-        to: adminUser.email,
+        to: recipientEmail,
         accountLabel: "admin",
         token: resetToken,
       });
@@ -913,8 +919,9 @@ app.post("/forgot-password/request", async (req, res) => {
     await customer.save();
 
     try {
+      const recipientEmail = customer.email || process.env.OWNER_EMAIL || SMTP_USER || EMAIL_FROM;
       await sendPasswordResetTokenEmail({
-        to: customer.email,
+        to: recipientEmail,
         accountLabel: "customer",
         token: resetToken,
       });
@@ -1104,6 +1111,47 @@ app.get("/admin/orders", adminAuth, requirePermission("manage_orders"), async (r
 
 /* ================= APPROVE / UPDATE ORDER ================= */
 
+app.delete("/admin/orders/:id", adminAuth, requirePermission("manage_orders"), async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid order id",
+      });
+    }
+
+    const order = await Order.findById(req.params.id);
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    await Order.findByIdAndDelete(req.params.id);
+
+    await logAdminAudit(req, {
+      adminId: req.admin.id,
+      username: req.admin.username,
+      action: "order_delete",
+      targetType: "order",
+      targetId: order._id.toString(),
+      status: "success",
+      details: `Deleted order ${order._id.toString()}`,
+    });
+
+    return res.json({
+      success: true,
+      message: "Order deleted successfully",
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
 app.put("/admin/orders/:id", adminAuth, requirePermission("manage_orders"), async (req, res) => {
   try {
     const nextStatus = req.body.status;
@@ -1271,6 +1319,47 @@ app.post("/admin/orders/:id/invoice", adminAuth, requirePermission("manage_order
       success: true,
       message: "Invoice posted successfully",
       order,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+app.delete("/admin/invoices/:id", adminAuth, requirePermission("manage_orders"), async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid invoice id",
+      });
+    }
+
+    const invoice = await Invoice.findById(req.params.id);
+    if (!invoice) {
+      return res.status(404).json({
+        success: false,
+        message: "Invoice not found",
+      });
+    }
+
+    await Invoice.findByIdAndDelete(req.params.id);
+
+    await logAdminAudit(req, {
+      adminId: req.admin.id,
+      username: req.admin.username,
+      action: "invoice_delete",
+      targetType: "invoice",
+      targetId: invoice._id.toString(),
+      status: "success",
+      details: `Deleted invoice ${invoice.invoiceNumber || invoice._id.toString()}`,
+    });
+
+    return res.json({
+      success: true,
+      message: "Invoice deleted successfully",
     });
   } catch (err) {
     return res.status(500).json({
@@ -1520,6 +1609,66 @@ app.get("/admin/admins", adminAuth, requireSuperAdmin, async (req, res) => {
   }
 });
 
+app.delete("/admin/admins/:id", adminAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid admin id",
+      });
+    }
+
+    const targetAdmin = await AdminModel.findById(req.params.id);
+    if (!targetAdmin) {
+      return res.status(404).json({
+        success: false,
+        message: "Admin not found",
+      });
+    }
+
+    if (targetAdmin._id.toString() === req.admin.id) {
+      return res.status(403).json({
+        success: false,
+        message: "You cannot delete your own admin account",
+      });
+    }
+
+    const remainingSuperAdmins = await AdminModel.countDocuments({
+      role: "superadmin",
+      _id: { $ne: targetAdmin._id },
+    });
+
+    if (targetAdmin.role === "superadmin" && remainingSuperAdmins === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "At least one super admin must remain",
+      });
+    }
+
+    await AdminModel.findByIdAndDelete(req.params.id);
+
+    await logAdminAudit(req, {
+      adminId: req.admin.id,
+      username: req.admin.username,
+      action: "admin_delete",
+      targetType: "admin",
+      targetId: targetAdmin._id.toString(),
+      status: "success",
+      details: `Deleted admin ${targetAdmin.username}`,
+    });
+
+    return res.json({
+      success: true,
+      message: "Admin deleted successfully",
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
 app.put("/admin/admins/:id", adminAuth, requireSuperAdmin, async (req, res) => {
   try {
     const targetAdmin = await AdminModel.findById(req.params.id);
@@ -1569,6 +1718,37 @@ app.put("/admin/admins/:id", adminAuth, requireSuperAdmin, async (req, res) => {
         permissions: targetAdmin.permissions,
         approved: targetAdmin.approved,
       },
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
+app.delete("/admin/audit-logs/:id", adminAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid audit log id",
+      });
+    }
+
+    const log = await AdminAuditLog.findById(req.params.id);
+    if (!log) {
+      return res.status(404).json({
+        success: false,
+        message: "Audit log not found",
+      });
+    }
+
+    await AdminAuditLog.findByIdAndDelete(req.params.id);
+
+    return res.json({
+      success: true,
+      message: "Audit log deleted successfully",
     });
   } catch (err) {
     return res.status(500).json({
@@ -1805,43 +1985,7 @@ app.post("/admin/products/migrate-images-to-cloudinary", adminAuth, requirePermi
     });
   }
 });
-app.put(
-  "/admin/products/:id",
-  adminAuth,
-  requirePermission("manage_products"),
-  async (req, res) => {
-    try {
-      const updatedProduct = await Products.findByIdAndUpdate(
-        req.params.id,
-        req.body,
-        {
-          new: true,
-          runValidators: true,
-        }
-      );
 
-      if (!updatedProduct) {
-        return res.status(404).json({
-          success: false,
-          message: "Product not found",
-        });
-      }
-
-      return res.json({
-        success: true,
-        message: "Product updated successfully",
-        product: updatedProduct,
-      });
-    } catch (err) {
-      console.error("Update product error:", err);
-
-      return res.status(500).json({
-        success: false,
-        message: err.message,
-      });
-    }
-  }
-);
 
 
 /* ================= DELETE PRODUCT ================= */
