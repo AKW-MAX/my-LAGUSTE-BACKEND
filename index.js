@@ -297,12 +297,11 @@ const isCloudinaryProductImageUrl = (value) => {
   const trimmed = value.trim();
   if (!trimmed) return false;
 
-  if (!CLOUDINARY_CLOUD_NAME) {
-    return false;
+  if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+    return true;
   }
 
-  const expectedPrefix = `https://res.cloudinary.com/${CLOUDINARY_CLOUD_NAME}/image/upload/`;
-  return trimmed.startsWith(expectedPrefix);
+  return false;
 };
 
 const uploadRemoteImageUrlToCloudinary = async (imageUrl) => {

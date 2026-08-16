@@ -1,6 +1,8 @@
 const jwt = require("jsonwebtoken");
 const AdminModel = require("../models/admin");
 
+const JWT_SECRET = process.env.JWT_SECRET;
+
 module.exports = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
@@ -21,7 +23,14 @@ module.exports = async (req, res, next) => {
 
     const token = authHeader.split(" ")[1];
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: "No token provided",
+      });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
 
     const adminUser = await AdminModel.findById(decoded.id).select(
       "_id username email role permissions approved"
