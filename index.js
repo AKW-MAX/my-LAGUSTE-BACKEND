@@ -399,6 +399,52 @@ const requirePermission = (permission) => (req, res, next) => {
   return next();
 };
 
+const normalizeBooleanValue = (value) => {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+
+    if (["true", "1", "yes", "on"].includes(normalized)) {
+      return true;
+    }
+
+    if (["false", "0", "no", "off", ""].includes(normalized)) {
+      return false;
+    }
+  }
+
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+
+  return false;
+};
+
+const normalizeProductPayload = (body = {}, options = {}) => {
+  const normalizedBody = { ...(body || {}) };
+  const defaultShowInNewProducts = options.defaultShowInNewProducts;
+
+  if (Object.prototype.hasOwnProperty.call(normalizedBody, "showInNewProducts")) {
+    normalizedBody.showInNewProducts = normalizeBooleanValue(normalizedBody.showInNewProducts);
+  } else if (typeof defaultShowInNewProducts === "boolean") {
+    normalizedBody.showInNewProducts = defaultShowInNewProducts;
+  }
+
+  return normalizedBody;
+};
+
+const serializeProduct = (product) => {
+  const plainProduct = product?.toObject ? product.toObject() : product;
+
+  return {
+    ...plainProduct,
+    showInNewProducts: normalizeBooleanValue(plainProduct?.showInNewProducts),
+  };
+};
+
 /* ---------------- CONNECT DB ---------------- */
 const startServer = () => {
   app.listen(ports, () => {
@@ -425,7 +471,7 @@ const startServer = () => {
 app.get(["/Products", "/products", "/allproducts"], async (req, res) => {
   try {
     const products = await Products.find();
-    res.json(products);
+    res.json(products.map(serializeProduct));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -596,7 +642,7 @@ app.get(["/Products/:id", "/products/:id"], async (req, res) => {
       return res.status(404).json({ message: "Product not found" });
     }
 
-    res.json(product);
+    res.json(serializeProduct(product));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -1787,7 +1833,7 @@ app.get("/admin/products", adminAuth, requirePermission("manage_products"), asyn
 
     res.json({
       success: true,
-      products,
+      products: products.map(serializeProduct),
     });
   } catch (err) {
     res.status(500).json({
@@ -1855,11 +1901,13 @@ app.post("/admin/products", adminAuth, requirePermission("add_product"), async (
       });
     }
 
-    const product = new Products(req.body);
+    const productPayload = normalizeProductPayload(req.body, { defaultShowInNewProducts: false });
+    productPayload.showInNewProducts = normalizeBooleanValue(productPayload.showInNewProducts);
+    const product = new Products(productPayload);
     await product.save();
     res.status(201).json({
       success: true,
-      product,
+      product: serializeProduct(product),
     });
   } catch (err) {
     res.status(500).json({
@@ -1881,16 +1929,18 @@ app.put("/admin/products/:id", adminAuth, requirePermission("manage_products"), 
       });
     }
 
+    const productPayload = normalizeProductPayload(req.body);
+    productPayload.showInNewProducts = normalizeBooleanValue(productPayload.showInNewProducts);
     const updatedProduct = await Products.findByIdAndUpdate(
       req.params.id,
-      req.body,
+      productPayload,
       {
         new: true,
       }
     );
     res.json({
       success: true,
-      product: updatedProduct,
+      product: updatedProduct ? serializeProduct(updatedProduct) : null,
     });
   } catch (err) {
     res.status(500).json({
