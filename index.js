@@ -14,6 +14,10 @@ const Invoice = require('./models/invoices');
 const adminAuth = require("./middleware/adminAuths");
 const AdminModel = require("./models/admin");
 const AdminAuditLog = require("./models/adminAuditLog");
+const AnalyticsEvent = require("./models/analyticsEvents");
+const BusinessReport = require("./models/businessReports");
+const { buildBusinessReportSnapshot, formatCurrency } = require("./utils/businessReport");
+const { verifyCustomerPassword } = require("./utils/customerAuth");
 
 const app = express();
 app.use(express.json());
@@ -31,6 +35,7 @@ const ALL_ADMIN_PERMISSIONS = [
   "admin_activity",
   "edit_admin_permissions",
   "sale_receipts",
+  "generate_daily_report",
 ];
 const MAX_FAILED_LOGIN_ATTEMPTS = 5;
 const ADMIN_LOCK_MINUTES = 15;
@@ -51,6 +56,8 @@ const SMTP_USER = process.env.SMTP_USER || "";
 const SMTP_PASS = process.env.SMTP_PASS || "";
 const SMTP_SECURE = String(process.env.SMTP_SECURE || "false").toLowerCase() === "true";
 const EMAIL_FROM = process.env.EMAIL_FROM || SMTP_USER;
+const DEFAULT_CONTACT_EMAIL = process.env.OWNER_EMAIL || "agriventureenterprise@gmail.com";
+const REPORT_RECIPIENT_EMAIL = process.env.REPORT_RECIPIENT_EMAIL || DEFAULT_CONTACT_EMAIL;
 const adminLoginRateMap = new Map();
 
 const generateInvoiceNumber = () => {
@@ -289,6 +296,44 @@ const sendPasswordResetTokenEmail = async ({ to, accountLabel, token }) => {
     text,
   });
 };
+
+const sendBusinessReportEmail = async (report) => {
+  const missingEmailConfig = getMissingEmailConfigKeys();
+  if (missingEmailConfig.length > 0) {
+    console.warn(`Business report email skipped: ${missingEmailConfig.join(", ")}`);
+    return null;
+  }
+
+  const transporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS,
+    },
+  });
+
+  const reportDate = report?.reportDate ? new Date(report.reportDate) : new Date();
+  const subject = `Agriventure daily business report - ${reportDate.toDateString()}`;
+  const text = [
+    "Agriventure daily business report",
+    `Traffic: ${report?.traffic?.visits ?? 0} visits, ${report?.traffic?.uniqueVisitors ?? 0} unique visitors`,
+    `Orders: ${report?.sales?.orders ?? 0} | Revenue: ${formatCurrency(report?.sales?.revenue ?? 0)} | Approved: ${report?.sales?.approvedOrders ?? 0} | Pending: ${report?.sales?.pendingOrders ?? 0}`,
+    `Top products: ${((report?.demand?.topProducts || []).map((item) => `${item.name} (${item.quantity})`).join(", ") || "None")}`,
+    "Insights:",
+    ...((report?.insights || []).map((insight) => `- ${insight}`)),
+  ].join("\n");
+
+  await transporter.sendMail({
+    from: EMAIL_FROM,
+    to: REPORT_RECIPIENT_EMAIL,
+    subject,
+    text,
+  });
+
+  return true;
+};
 /* ---------------- CLOUDINARY IMAGE HELPERS ---------------- */
 
 const isCloudinaryProductImageUrl = (value) => {
@@ -445,6 +490,48 @@ const serializeProduct = (product) => {
 };
 
 /* ---------------- CONNECT DB ---------------- */
+const generateBusinessReportForDate = async (requestedDate = new Date()) => {
+  const normalizedDate = requestedDate instanceof Date && !Number.isNaN(requestedDate.getTime())
+    ? requestedDate
+    : new Date();
+
+  const [orders, products, analyticsEvents] = await Promise.all([
+    Order.find().lean(),
+    Products.find().lean(),
+    AnalyticsEvent.find().lean(),
+  ]);
+
+  const snapshot = buildBusinessReportSnapshot({
+    orders,
+    products,
+    analyticsEvents,
+    now: normalizedDate,
+  });
+
+  const reportDoc = await BusinessReport.findOneAndUpdate(
+    { reportDate: snapshot.reportDate },
+    {
+      $set: {
+        ...snapshot,
+        generatedAt: new Date(),
+      },
+    },
+    {
+      upsert: true,
+      new: true,
+      setDefaultsOnInsert: true,
+    }
+  );
+
+  try {
+    await sendBusinessReportEmail(reportDoc);
+  } catch (reportEmailError) {
+    console.error("Business report email delivery failed", reportEmailError);
+  }
+
+  return reportDoc;
+};
+
 const startServer = () => {
   app.listen(ports, () => {
     console.log(`Server is running on port ${ports}`);
@@ -459,6 +546,15 @@ const startServer = () => {
     .connect(mongoUri)
     .then(() => {
       console.log("MongoDB connected");
+      generateBusinessReportForDate().catch((err) => {
+        console.error("Daily business report generation failed", err);
+      });
+
+      setInterval(() => {
+        generateBusinessReportForDate().catch((err) => {
+          console.error("Scheduled business report generation failed", err);
+        });
+      }, 24 * 60 * 60 * 1000);
     })
     .catch((err) => {
       console.error("MongoDB connection failed", err);
@@ -508,19 +604,24 @@ app.post('/login', async (req, res) => {
     const customer = await findCustomerByEmail(email);
     if (!customer) return res.status(401).json({ message: "Invalid login" });
 
-    const match = await bcrypt.compare(password, customer.password);
+    const { match, shouldHash } = await verifyCustomerPassword(password, customer.password);
     if (!match) return res.status(401).json({ message: "Invalid login" });
 
-  res.status(200).json({
-  message: "Login successful",
-  user: {
-    id: customer._id,
-    first_name: customer.first_name,
-    last_name: customer.last_name,
-    email: customer.email,
-    profileImage: customer.profileImage || ""
-  }
-});
+    if (shouldHash) {
+      customer.password = await bcrypt.hash(password, 10);
+      await customer.save();
+    }
+
+    res.status(200).json({
+      message: "Login successful",
+      user: {
+        id: customer._id,
+        first_name: customer.first_name,
+        last_name: customer.last_name,
+        email: customer.email,
+        profileImage: customer.profileImage || ""
+      }
+    });
 
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -828,7 +929,7 @@ app.post("/admin/forgot-password/request", async (req, res) => {
     await adminUser.save();
 
     try {
-      const recipientEmail = adminUser.email || process.env.OWNER_EMAIL || SMTP_USER || EMAIL_FROM;
+      const recipientEmail = adminUser.email || DEFAULT_CONTACT_EMAIL || SMTP_USER || EMAIL_FROM;
       await sendPasswordResetTokenEmail({
         to: recipientEmail,
         accountLabel: "admin",
@@ -964,7 +1065,7 @@ app.post("/forgot-password/request", async (req, res) => {
     await customer.save();
 
     try {
-      const recipientEmail = customer.email || process.env.OWNER_EMAIL || SMTP_USER || EMAIL_FROM;
+      const recipientEmail = customer.email || DEFAULT_CONTACT_EMAIL || SMTP_USER || EMAIL_FROM;
       await sendPasswordResetTokenEmail({
         to: recipientEmail,
         accountLabel: "customer",
@@ -1888,6 +1989,50 @@ app.post("/admin/cloudinary/sign-upload", adminAuth, requirePermission("add_prod
   }
 });
 
+
+/* ================= ANALYTICS TRACKING ================= */
+
+app.post(["/api/analytics", "/analytics"], async (req, res) => {
+  try {
+    const eventPayload = {
+      eventType: String(req.body?.eventType || "page_view").trim(),
+      page: String(req.body?.page || "/").trim(),
+      referrer: String(req.body?.referrer || "").trim(),
+      sessionId: String(req.body?.sessionId || "").trim(),
+      ip: String(req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip || "").trim(),
+      userAgent: String(req.headers["user-agent"] || "").trim(),
+      metadata: req.body?.metadata || {},
+    };
+
+    const event = await AnalyticsEvent.create(eventPayload);
+    return res.status(201).json({ success: true, event });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.get(["/admin/business-report", "/business-report"], adminAuth, requirePermission("audit_logs"), async (req, res) => {
+  try {
+    const requestedDate = req.query.date ? new Date(req.query.date) : new Date();
+    if (Number.isNaN(requestedDate.getTime())) {
+      return res.status(400).json({ success: false, message: "Invalid date" });
+    }
+
+    const reportDoc = await generateBusinessReportForDate(requestedDate);
+    return res.json({ success: true, report: reportDoc });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.get(["/admin/business-report/latest", "/business-report/latest"], adminAuth, requirePermission("audit_logs"), async (req, res) => {
+  try {
+    const report = await BusinessReport.findOne({}).sort({ reportDate: -1 }).lean();
+    return res.json({ success: true, report });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
 
 /* ================= ADD PRODUCT ================= */
 

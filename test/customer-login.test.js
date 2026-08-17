@@ -19,3 +19,11 @@ test('accepts bcrypt-hashed customer passwords without migrating them', async ()
   assert.equal(result.match, true);
   assert.equal(result.shouldHash, false);
 });
+
+test('accepts passwords that differ only by surrounding whitespace', async () => {
+  const password = 'TrimMe123!';
+  const result = await verifyCustomerPassword(`  ${password}  `, password);
+
+  assert.equal(result.match, true);
+  assert.equal(result.shouldHash, true);
+});

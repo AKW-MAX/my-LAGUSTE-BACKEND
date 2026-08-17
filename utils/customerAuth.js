@@ -6,16 +6,19 @@ const isBcryptHash = (value = '') => {
 };
 
 const verifyCustomerPassword = async (providedPassword, storedPassword) => {
-  if (!providedPassword || !storedPassword) {
+  const normalizedProvided = String(providedPassword ?? "").trim();
+  const normalizedStored = String(storedPassword ?? "").trim();
+
+  if (!normalizedProvided || !normalizedStored) {
     return { match: false, shouldHash: false };
   }
 
-  if (isBcryptHash(storedPassword)) {
-    const match = await bcrypt.compare(providedPassword, storedPassword);
+  if (isBcryptHash(normalizedStored)) {
+    const match = await bcrypt.compare(normalizedProvided, normalizedStored);
     return { match, shouldHash: false };
   }
 
-  const match = providedPassword === storedPassword;
+  const match = normalizedProvided === normalizedStored;
   return { match, shouldHash: match };
 };
 
