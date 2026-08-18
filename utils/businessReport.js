@@ -8,6 +8,18 @@ const formatCurrency = (value) => {
 };
 
 const toDate = (value) => {
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
+
+  if (typeof value === "string") {
+    const trimmedValue = value.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmedValue)) {
+      const [year, month, day] = trimmedValue.split("-").map(Number);
+      return new Date(year, month - 1, day);
+    }
+  }
+
   const parsed = value ? new Date(value) : null;
   return Number.isNaN(parsed?.getTime()) ? null : parsed;
 };
@@ -31,6 +43,31 @@ const createPreviousDayRange = (now = new Date()) => {
   end.setHours(0, 0, 0, 0);
 
   return { start, end };
+};
+
+const toLocalDateString = (value = new Date()) => {
+  const date = toDate(value) || new Date(value);
+  if (!date) return "";
+
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
+
+const shouldReuseExistingReport = (existingReport, requestedDate = new Date()) => {
+  if (!existingReport?.reportDate) return false;
+
+  const normalizedDate = toDate(requestedDate) || new Date(requestedDate);
+  if (!normalizedDate || Number.isNaN(normalizedDate.getTime())) {
+    return false;
+  }
+
+  const requestedDateKey = toLocalDateString(normalizedDate);
+  const existingDate = toDate(existingReport.reportDate);
+  const existingDateKey = existingDate ? toLocalDateString(existingDate) : String(existingReport.reportDate || "").trim().slice(0, 10);
+
+  return Boolean(requestedDateKey && existingDateKey && requestedDateKey === existingDateKey);
 };
 
 const normalizeProductName = (value) => String(value || "").trim();
@@ -70,6 +107,11 @@ const inferProductIdFromEvent = (event) => {
   return candidates.find((candidate) => normalizeProductName(candidate)) || "";
 };
 
+const isPageViewEvent = (event) => {
+  const type = String(event?.eventType || "").trim().toLowerCase();
+  return type === "page_view" || type === "visit" || type === "landing";
+};
+
 const isCartEvent = (event) => {
   const type = String(event?.eventType || "").trim().toLowerCase();
   return type.includes("cart") || type.includes("add_to_cart") || type.includes("checkout");
@@ -77,9 +119,10 @@ const isCartEvent = (event) => {
 
 const isProductViewEvent = (event) => {
   const type = String(event?.eventType || "").trim().toLowerCase();
-  if (type.includes("view") || type.includes("product")) return true;
+  if (type.includes("view") && !type.includes("page")) return true;
+  if (type.includes("product")) return true;
   const productName = inferProductNameFromEvent(event);
-  return Boolean(productName);
+  return Boolean(productName) && !isPageViewEvent(event) && !isCartEvent(event);
 };
 
 const getEventProductReference = (event) => {
@@ -175,6 +218,44 @@ const buildBusinessReportSnapshot = ({ orders = [], products = [], analyticsEven
     viewedProductMap.set(reference, existing);
   });
 
+  const productDemandSignals = new Map();
+  const registerSignal = (reference, name, field, increment = 1) => {
+    if (!reference) return;
+
+    const existing = productDemandSignals.get(reference) || {
+      name: name || reference,
+      views: 0,
+      cartAdditions: 0,
+      orders: 0,
+    };
+
+    existing[field] += increment;
+    productDemandSignals.set(reference, existing);
+  };
+
+  viewedProductMap.forEach((entry, reference) => {
+    registerSignal(reference, entry.name, "views", entry.count);
+  });
+
+  cartEventMap.forEach((entry, reference) => {
+    registerSignal(reference, entry.name, "cartAdditions", entry.count);
+  });
+
+  dailyOrders.forEach((order) => {
+    const seenProducts = new Set();
+    const items = Array.isArray(order?.orderItems) ? order.orderItems : [];
+
+    items.forEach((item) => {
+      const name = String(item?.name || "Unknown product").trim();
+      const productId = String(item?._id || item?.productId || "").trim();
+      const reference = name || productId || "";
+      if (!reference || seenProducts.has(reference)) return;
+
+      seenProducts.add(reference);
+      registerSignal(reference, name || reference, "orders", 1);
+    });
+  });
+
   const purchasedNames = new Set(Array.from(orderedProductsMap.keys()));
   const viewedButNotPurchased = Array.from(viewedProductMap.values())
     .filter((entry) => !purchasedNames.has(entry.name))
@@ -207,14 +288,28 @@ const buildBusinessReportSnapshot = ({ orders = [], products = [], analyticsEven
     .sort((left, right) => right.quantity - left.quantity)
     .slice(0, 5);
 
+  const mostDemandedProducts = Array.from(productDemandSignals.values())
+    .sort((left, right) => {
+      const scoreLeft = left.views + left.cartAdditions + left.orders;
+      const scoreRight = right.views + right.cartAdditions + right.orders;
+      return scoreRight - scoreLeft || right.views - left.views || right.orders - left.orders;
+    })
+    .slice(0, 5);
+
+  const attentionWithoutSales = Array.from(productDemandSignals.values())
+    .filter((entry) => entry.views > 0 && entry.orders === 0)
+    .sort((left, right) => right.views - left.views || right.cartAdditions - left.cartAdditions)
+    .slice(0, 5);
+
   const lowStockProducts = (products || [])
     .filter((product) => Number(product?.stock || 0) <= 5)
     .sort((left, right) => Number(left?.stock || 0) - Number(right?.stock || 0))
     .slice(0, 5);
 
-  const trafficCount = dailyEvents.length;
+  const pageViewEvents = dailyEvents.filter((event) => isPageViewEvent(event));
+  const trafficCount = pageViewEvents.length;
   const uniqueVisitors = new Set(
-    dailyEvents
+    pageViewEvents
       .map((event) => String(event?.ip || event?.userAgent || "unknown").trim())
       .filter(Boolean)
   ).size;
@@ -269,7 +364,7 @@ const buildBusinessReportSnapshot = ({ orders = [], products = [], analyticsEven
   }
 
   return {
-    reportDate: start.toISOString(),
+    reportDate: toLocalDateString(start),
     traffic: {
       visits: trafficCount,
       uniqueVisitors,
@@ -288,6 +383,8 @@ const buildBusinessReportSnapshot = ({ orders = [], products = [], analyticsEven
       cartAdditions: Array.from(cartEventMap.values()).sort((left, right) => right.count - left.count),
       viewedButNotPurchased,
       increasingDemandProducts,
+      mostDemandedProducts,
+      attentionWithoutSales,
     },
     categories: {
       bestSelling: Array.from(categoryDemandMap.values()).sort((left, right) => right.quantity - left.quantity),
@@ -306,4 +403,5 @@ module.exports = {
   buildBusinessReportSnapshot,
   formatCurrency,
   createDayRange,
+  shouldReuseExistingReport,
 };

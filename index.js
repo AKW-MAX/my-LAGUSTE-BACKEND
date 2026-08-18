@@ -16,12 +16,17 @@ const AdminModel = require("./models/admin");
 const AdminAuditLog = require("./models/adminAuditLog");
 const AnalyticsEvent = require("./models/analyticsEvents");
 const BusinessReport = require("./models/businessReports");
-const { buildBusinessReportSnapshot, formatCurrency } = require("./utils/businessReport");
-const { verifyCustomerPassword } = require("./utils/customerAuth");
+const { buildBusinessReportSnapshot, formatCurrency, shouldReuseExistingReport } = require("./utils/businessReport");
+const { normalizeCustomerEmail, verifyCustomerPassword } = require("./utils/customerAuth");
 
 const app = express();
 app.use(express.json());
-app.use(cors());
+app.use(cors({
+  origin: true,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 
 const mongoUri = process.env.MONGO_URI;
 const ports = process.env.PORT || 5000;
@@ -253,13 +258,10 @@ const findAdminByUsername = async (username) => {
 };
 
 const findCustomerByEmail = async (email) => {
-  const trimmed = String(email || "").trim();
-  if (!trimmed) return null;
+  const normalizedEmail = normalizeCustomerEmail(email);
+  if (!normalizedEmail) return null;
   return Customer.findOne({
-    email: {
-      $regex: `^${escapeRegex(trimmed)}$`,
-      $options: "i",
-    },
+    email: normalizedEmail,
   });
 };
 
@@ -495,6 +497,13 @@ const generateBusinessReportForDate = async (requestedDate = new Date()) => {
     ? requestedDate
     : new Date();
 
+  const reportDateKey = `${normalizedDate.getFullYear()}-${String(normalizedDate.getMonth() + 1).padStart(2, "0")}-${String(normalizedDate.getDate()).padStart(2, "0")}`;
+  const existingReport = await BusinessReport.findOne({ reportDate: reportDateKey }).lean();
+
+  if (existingReport && shouldReuseExistingReport(existingReport, normalizedDate)) {
+    return existingReport;
+  }
+
   const [orders, products, analyticsEvents] = await Promise.all([
     Order.find().lean(),
     Products.find().lean(),
@@ -576,8 +585,9 @@ app.get(["/Products", "/products", "/allproducts"], async (req, res) => {
 app.post('/register', async (req, res) => {
   try {
     const { first_name, last_name, email, password } = req.body;
+    const normalizedEmail = normalizeCustomerEmail(email);
 
-    const existing = await Customer.findOne({ email });
+    const existing = await Customer.findOne({ email: normalizedEmail });
     if (existing) return res.status(409).json({ message: "User exists" });
 
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -585,7 +595,7 @@ app.post('/register', async (req, res) => {
     const user = await Customer.create({
       first_name,
       last_name,
-      email,
+      email: normalizedEmail,
       password: hashedPassword,
     });
 
@@ -604,10 +614,15 @@ app.post('/login', async (req, res) => {
     const customer = await findCustomerByEmail(email);
     if (!customer) return res.status(401).json({ message: "Invalid login" });
 
-    const { match, shouldHash } = await verifyCustomerPassword(password, customer.password);
-    if (!match) return res.status(401).json({ message: "Invalid login" });
+    const passwordMatch = await verifyCustomerPassword(password, customer.password);
+    const isValidLogin = passwordMatch?.match === true;
+    console.log("[customer-login] email", email, "passwordMatch", passwordMatch);
 
-    if (shouldHash) {
+    if (!isValidLogin) {
+      return res.status(401).json({ message: "Invalid login" });
+    }
+
+    if (passwordMatch?.shouldHash) {
       customer.password = await bcrypt.hash(password, 10);
       await customer.save();
     }
@@ -2013,7 +2028,11 @@ app.post(["/api/analytics", "/analytics"], async (req, res) => {
 
 app.get(["/admin/business-report", "/business-report"], adminAuth, requirePermission("audit_logs"), async (req, res) => {
   try {
-    const requestedDate = req.query.date ? new Date(req.query.date) : new Date();
+    const rawDate = String(req.query.date || "").trim();
+    const requestedDate = rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate)
+      ? new Date(Number(rawDate.slice(0, 4)), Number(rawDate.slice(5, 7)) - 1, Number(rawDate.slice(8, 10)))
+      : new Date(rawDate || new Date());
+
     if (Number.isNaN(requestedDate.getTime())) {
       return res.status(400).json({ success: false, message: "Invalid date" });
     }

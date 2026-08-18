@@ -1,5 +1,27 @@
 const bcrypt = require('bcrypt');
 
+const normalizeCustomerEmail = (value = '') => {
+  return String(value ?? '').trim().toLowerCase();
+};
+
+const escapeRegex = (value = '') => {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+};
+
+const buildCustomerEmailQuery = (value = '') => {
+  const normalizedEmail = normalizeCustomerEmail(value);
+  if (!normalizedEmail) {
+    return null;
+  }
+
+  return {
+    email: {
+      $regex: `^${escapeRegex(normalizedEmail)}$`,
+      $options: 'i',
+    },
+  };
+};
+
 const isBcryptHash = (value = '') => {
   if (typeof value !== 'string') return false;
   return /^\$2[aby]\$/.test(value);
@@ -23,5 +45,7 @@ const verifyCustomerPassword = async (providedPassword, storedPassword) => {
 };
 
 module.exports = {
+  normalizeCustomerEmail,
+  buildCustomerEmailQuery,
   verifyCustomerPassword,
 };
