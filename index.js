@@ -16,7 +16,7 @@ const AdminModel = require("./models/admin");
 const AdminAuditLog = require("./models/adminAuditLog");
 const AnalyticsEvent = require("./models/analyticsEvents");
 const BusinessReport = require("./models/businessReports");
-const { buildBusinessReportSnapshot, formatCurrency, shouldReuseExistingReport } = require("./utils/businessReport");
+const { buildBusinessReportSnapshot, formatCurrency, shouldReuseExistingReport, createDayRange, createPreviousDayRange } = require("./utils/businessReport");
 const { normalizeCustomerEmail, verifyCustomerPassword } = require("./utils/customerAuth");
 
 const app = express();
@@ -504,16 +504,23 @@ const generateBusinessReportForDate = async (requestedDate = new Date()) => {
     return existingReport;
   }
 
-  const [orders, products, analyticsEvents] = await Promise.all([
-    Order.find().lean(),
-    Products.find().lean(),
-    AnalyticsEvent.find().lean(),
+  const { start, end } = createDayRange(normalizedDate);
+  const { start: previousStart, end: previousEnd } = createPreviousDayRange(normalizedDate);
+
+  const [allOrders, dailyOrders, previousDayOrders, products, analyticsEvents] = await Promise.all([
+    Order.find({}).select("createdAt totalAmount status orderItems customer user").lean(),
+    Order.find({ createdAt: { $gte: start, $lt: end } }).select("createdAt totalAmount status orderItems customer user").lean(),
+    Order.find({ createdAt: { $gte: previousStart, $lt: previousEnd } }).select("createdAt totalAmount status orderItems customer user").lean(),
+    Products.find({}).select("name category stock").lean(),
+    AnalyticsEvent.find({ createdAt: { $gte: start, $lt: end } }).select("createdAt eventType page referrer sessionId ip userAgent metadata").lean(),
   ]);
 
   const snapshot = buildBusinessReportSnapshot({
-    orders,
+    orders: allOrders,
     products,
     analyticsEvents,
+    dailyOrders,
+    previousDayOrders,
     now: normalizedDate,
   });
 
@@ -533,7 +540,9 @@ const generateBusinessReportForDate = async (requestedDate = new Date()) => {
   );
 
   try {
-    await sendBusinessReportEmail(reportDoc);
+    sendBusinessReportEmail(reportDoc).catch((reportEmailError) => {
+      console.error("Business report email delivery failed", reportEmailError);
+    });
   } catch (reportEmailError) {
     console.error("Business report email delivery failed", reportEmailError);
   }

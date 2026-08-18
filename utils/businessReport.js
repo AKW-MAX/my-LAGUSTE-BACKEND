@@ -131,36 +131,44 @@ const getEventProductReference = (event) => {
   return { productName, productId };
 };
 
-const buildBusinessReportSnapshot = ({ orders = [], products = [], analyticsEvents = [], now = new Date() } = {}) => {
+const buildBusinessReportSnapshot = ({
+  orders = [],
+  products = [],
+  analyticsEvents = [],
+  dailyOrders = null,
+  previousDayOrders = null,
+  dailyEvents = null,
+  now = new Date(),
+} = {}) => {
   const { start, end } = createDayRange(now);
   const { start: previousStart, end: previousEnd } = createPreviousDayRange(now);
 
-  const dailyOrders = (orders || []).filter((order) => {
+  const resolvedDailyOrders = dailyOrders ?? (orders || []).filter((order) => {
     const createdAt = toDate(order?.createdAt || order?.created_at);
     return createdAt && createdAt >= start && createdAt < end;
   });
 
-  const dailyEvents = (analyticsEvents || []).filter((event) => {
+  const resolvedDailyEvents = dailyEvents ?? (analyticsEvents || []).filter((event) => {
     const createdAt = toDate(event?.createdAt || event?.created_at);
     return createdAt && createdAt >= start && createdAt < end;
   });
 
-  const previousDayOrders = (orders || []).filter((order) => {
+  const resolvedPreviousDayOrders = previousDayOrders ?? (orders || []).filter((order) => {
     const createdAt = toDate(order?.createdAt || order?.created_at);
     return createdAt && createdAt >= previousStart && createdAt < previousEnd;
   });
 
-  const revenue = dailyOrders.reduce((total, order) => total + Number(order?.totalAmount || 0), 0);
-  const pendingOrders = dailyOrders.filter((order) => String(order?.status || "").trim().toLowerCase() === "pending").length;
-  const approvedOrders = dailyOrders.filter((order) => String(order?.status || "").trim().toLowerCase() === "approved").length;
-  const averageOrderValue = dailyOrders.length > 0 ? revenue / dailyOrders.length : 0;
+  const revenue = resolvedDailyOrders.reduce((total, order) => total + Number(order?.totalAmount || 0), 0);
+  const pendingOrders = resolvedDailyOrders.filter((order) => String(order?.status || "").trim().toLowerCase() === "pending").length;
+  const approvedOrders = resolvedDailyOrders.filter((order) => String(order?.status || "").trim().toLowerCase() === "approved").length;
+  const averageOrderValue = resolvedDailyOrders.length > 0 ? revenue / resolvedDailyOrders.length : 0;
 
   const productDemandMap = new Map();
   const orderedProductsMap = new Map();
   const categoryDemandMap = new Map();
   const productLookup = buildProductLookup(products || []);
 
-  dailyOrders.forEach((order) => {
+  resolvedDailyOrders.forEach((order) => {
     const items = Array.isArray(order?.orderItems) ? order.orderItems : [];
     items.forEach((item) => {
       const name = String(item?.name || "Unknown product").trim();
@@ -193,7 +201,7 @@ const buildBusinessReportSnapshot = ({ orders = [], products = [], analyticsEven
     .slice(0, 5);
 
   const cartEventMap = new Map();
-  dailyEvents.forEach((event) => {
+  resolvedDailyEvents.forEach((event) => {
     if (!isCartEvent(event)) return;
 
     const { productName, productId } = getEventProductReference(event);
@@ -206,7 +214,7 @@ const buildBusinessReportSnapshot = ({ orders = [], products = [], analyticsEven
   });
 
   const viewedProductMap = new Map();
-  dailyEvents.forEach((event) => {
+  resolvedDailyEvents.forEach((event) => {
     if (!isProductViewEvent(event)) return;
 
     const { productName, productId } = getEventProductReference(event);
@@ -241,7 +249,7 @@ const buildBusinessReportSnapshot = ({ orders = [], products = [], analyticsEven
     registerSignal(reference, entry.name, "cartAdditions", entry.count);
   });
 
-  dailyOrders.forEach((order) => {
+  resolvedDailyOrders.forEach((order) => {
     const seenProducts = new Set();
     const items = Array.isArray(order?.orderItems) ? order.orderItems : [];
 
@@ -263,7 +271,7 @@ const buildBusinessReportSnapshot = ({ orders = [], products = [], analyticsEven
     .slice(0, 5);
 
   const previousDayDemandMap = new Map();
-  previousDayOrders.forEach((order) => {
+  resolvedPreviousDayOrders.forEach((order) => {
     const items = Array.isArray(order?.orderItems) ? order.orderItems : [];
     items.forEach((item) => {
       const name = String(item?.name || "Unknown product").trim();
@@ -306,7 +314,7 @@ const buildBusinessReportSnapshot = ({ orders = [], products = [], analyticsEven
     .sort((left, right) => Number(left?.stock || 0) - Number(right?.stock || 0))
     .slice(0, 5);
 
-  const pageViewEvents = dailyEvents.filter((event) => isPageViewEvent(event));
+  const pageViewEvents = resolvedDailyEvents.filter((event) => isPageViewEvent(event));
   const trafficCount = pageViewEvents.length;
   const uniqueVisitors = new Set(
     pageViewEvents
@@ -314,7 +322,7 @@ const buildBusinessReportSnapshot = ({ orders = [], products = [], analyticsEven
       .filter(Boolean)
   ).size;
 
-  const conversionRate = trafficCount > 0 ? (dailyOrders.length / trafficCount) * 100 : 0;
+  const conversionRate = trafficCount > 0 ? (resolvedDailyOrders.length / trafficCount) * 100 : 0;
 
   const repeatCustomers = Array.from(
     new Map(
@@ -352,8 +360,8 @@ const buildBusinessReportSnapshot = ({ orders = [], products = [], analyticsEven
     insights.push("Traffic was quiet today; consider a promotion or retargeting push.");
   }
 
-  if (dailyOrders.length > 0) {
-    insights.push(`Sales generated ${formatCurrency(revenue)} across ${dailyOrders.length} orders.`);
+  if (resolvedDailyOrders.length > 0) {
+    insights.push(`Sales generated ${formatCurrency(revenue)} across ${resolvedDailyOrders.length} orders.`);
   } else {
     insights.push("No orders were recorded today. Review product visibility and promotional offers.");
   }
@@ -371,7 +379,7 @@ const buildBusinessReportSnapshot = ({ orders = [], products = [], analyticsEven
       conversionRate: Number(conversionRate.toFixed(2)),
     },
     sales: {
-      orders: dailyOrders.length,
+      orders: resolvedDailyOrders.length,
       revenue,
       pendingOrders,
       approvedOrders,
@@ -403,5 +411,6 @@ module.exports = {
   buildBusinessReportSnapshot,
   formatCurrency,
   createDayRange,
+  createPreviousDayRange,
   shouldReuseExistingReport,
 };
