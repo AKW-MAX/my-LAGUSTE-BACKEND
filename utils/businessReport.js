@@ -24,25 +24,28 @@ const toDate = (value) => {
   return Number.isNaN(parsed?.getTime()) ? null : parsed;
 };
 
-const createDayRange = (now = new Date()) => {
-  const start = new Date(now);
-  start.setHours(0, 0, 0, 0);
+const createDayRange = (now = new Date(), timeZoneOffsetMinutes = null) => {
+  const effectiveOffset = Number.isFinite(timeZoneOffsetMinutes) ? timeZoneOffsetMinutes : now.getTimezoneOffset();
+  const localDate = new Date(now.getTime() + effectiveOffset * 60 * 1000);
+  const startUtc = new Date(
+    Date.UTC(
+      localDate.getUTCFullYear(),
+      localDate.getUTCMonth(),
+      localDate.getUTCDate()
+    ) - effectiveOffset * 60 * 1000
+  );
 
-  const end = new Date(start);
-  end.setDate(end.getDate() + 1);
+  const end = new Date(startUtc.getTime() + 24 * 60 * 60 * 1000);
 
-  return { start, end };
+  return { start: startUtc, end };
 };
 
-const createPreviousDayRange = (now = new Date()) => {
-  const start = new Date(now);
-  start.setHours(0, 0, 0, 0);
-  start.setDate(start.getDate() - 1);
+const createPreviousDayRange = (now = new Date(), timeZoneOffsetMinutes = null) => {
+  const { start } = createDayRange(now, timeZoneOffsetMinutes);
+  const previousStart = new Date(start.getTime() - 24 * 60 * 60 * 1000);
+  const end = new Date(start.getTime());
 
-  const end = new Date(now);
-  end.setHours(0, 0, 0, 0);
-
-  return { start, end };
+  return { start: previousStart, end };
 };
 
 const toLocalDateString = (value = new Date()) => {
@@ -139,9 +142,11 @@ const buildBusinessReportSnapshot = ({
   previousDayOrders = null,
   dailyEvents = null,
   now = new Date(),
+  reportDateKey = null,
+  timeZoneOffsetMinutes = null,
 } = {}) => {
-  const { start, end } = createDayRange(now);
-  const { start: previousStart, end: previousEnd } = createPreviousDayRange(now);
+  const { start, end } = createDayRange(now, timeZoneOffsetMinutes);
+  const { start: previousStart, end: previousEnd } = createPreviousDayRange(now, timeZoneOffsetMinutes);
 
   const resolvedDailyOrders = dailyOrders ?? (orders || []).filter((order) => {
     const createdAt = toDate(order?.createdAt || order?.created_at);
@@ -372,7 +377,7 @@ const buildBusinessReportSnapshot = ({
   }
 
   return {
-    reportDate: toLocalDateString(start),
+    reportDate: reportDateKey || toLocalDateString(start),
     traffic: {
       visits: trafficCount,
       uniqueVisitors,

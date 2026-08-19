@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const bcrypt = require('bcrypt');
 const { verifyCustomerPassword, normalizeCustomerEmail } = require('../utils/customerAuth');
-const { buildBusinessReportSnapshot, shouldReuseExistingReport } = require('../utils/businessReport');
+const { buildBusinessReportSnapshot, shouldReuseExistingReport, createDayRange } = require('../utils/businessReport');
 
 test('accepts legacy plain-text customer passwords and marks them for migration', async () => {
   const password = 'LegacyPass123!';
@@ -102,4 +102,11 @@ test('reuses an existing same-day report instead of rebuilding it', () => {
   const result = shouldReuseExistingReport(existingReport, new Date(2024, 7, 9, 14, 30, 0));
 
   assert.equal(result, true);
+});
+
+test('creates a day range using the supplied timezone offset', () => {
+  const { start, end } = createDayRange(new Date('2024-08-09T00:00:00.000Z'), -180);
+
+  assert.equal(start.toISOString(), '2024-08-08T03:00:00.000Z');
+  assert.equal(end.toISOString(), '2024-08-09T03:00:00.000Z');
 });

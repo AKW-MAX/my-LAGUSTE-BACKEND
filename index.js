@@ -18,6 +18,7 @@ const AnalyticsEvent = require("./models/analyticsEvents");
 const BusinessReport = require("./models/businessReports");
 const { buildBusinessReportSnapshot, formatCurrency, shouldReuseExistingReport, createDayRange, createPreviousDayRange } = require("./utils/businessReport");
 const { normalizeCustomerEmail, verifyCustomerPassword } = require("./utils/customerAuth");
+const { normalizeSmtpConfig } = require("./utils/smtpConfig");
 
 const app = express();
 app.use(express.json());
@@ -55,12 +56,13 @@ const CLOUDINARY_CLOUD_NAME =
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY || "";
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET || "";
 const CLOUDINARY_PRODUCT_IMAGE_TRANSFORMATION = "c_fill,g_auto,w_480,h_600,q_auto,f_auto";
-const SMTP_HOST = process.env.SMTP_HOST || "";
-const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
-const SMTP_USER = process.env.SMTP_USER || "";
-const SMTP_PASS = process.env.SMTP_PASS || "";
-const SMTP_SECURE = String(process.env.SMTP_SECURE || "false").toLowerCase() === "true";
-const EMAIL_FROM = process.env.EMAIL_FROM || SMTP_USER;
+const smtpConfig = normalizeSmtpConfig(process.env);
+const SMTP_HOST = smtpConfig.host;
+const SMTP_PORT = smtpConfig.port;
+const SMTP_USER = smtpConfig.user;
+const SMTP_PASS = smtpConfig.pass;
+const SMTP_SECURE = smtpConfig.secure;
+const EMAIL_FROM = smtpConfig.from;
 const DEFAULT_CONTACT_EMAIL = process.env.OWNER_EMAIL || "agriventureenterprise@gmail.com";
 const REPORT_RECIPIENT_EMAIL = process.env.REPORT_RECIPIENT_EMAIL || DEFAULT_CONTACT_EMAIL;
 const adminLoginRateMap = new Map();
@@ -274,9 +276,13 @@ const sendPasswordResetTokenEmail = async ({ to, accountLabel, token }) => {
   }
 
   const transporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_SECURE,
+    ...(String(SMTP_HOST).trim().toLowerCase() === "smtp.gmail.com"
+      ? { service: "gmail" }
+      : {
+          host: SMTP_HOST,
+          port: SMTP_PORT,
+          secure: SMTP_SECURE,
+        }),
     auth: {
       user: SMTP_USER,
       pass: SMTP_PASS,
@@ -307,9 +313,13 @@ const sendBusinessReportEmail = async (report) => {
   }
 
   const transporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_SECURE,
+    ...(String(SMTP_HOST).trim().toLowerCase() === "smtp.gmail.com"
+      ? { service: "gmail" }
+      : {
+          host: SMTP_HOST,
+          port: SMTP_PORT,
+          secure: SMTP_SECURE,
+        }),
     auth: {
       user: SMTP_USER,
       pass: SMTP_PASS,
@@ -492,20 +502,20 @@ const serializeProduct = (product) => {
 };
 
 /* ---------------- CONNECT DB ---------------- */
-const generateBusinessReportForDate = async (requestedDate = new Date()) => {
+const generateBusinessReportForDate = async (requestedDate = new Date(), timeZoneOffsetMinutes = null, reportDateKeyOverride = null) => {
   const normalizedDate = requestedDate instanceof Date && !Number.isNaN(requestedDate.getTime())
     ? requestedDate
     : new Date();
 
-  const reportDateKey = `${normalizedDate.getFullYear()}-${String(normalizedDate.getMonth() + 1).padStart(2, "0")}-${String(normalizedDate.getDate()).padStart(2, "0")}`;
+  const reportDateKey = reportDateKeyOverride || `${normalizedDate.getUTCFullYear()}-${String(normalizedDate.getUTCMonth() + 1).padStart(2, "0")}-${String(normalizedDate.getUTCDate()).padStart(2, "0")}`;
   const existingReport = await BusinessReport.findOne({ reportDate: reportDateKey }).lean();
 
   if (existingReport && shouldReuseExistingReport(existingReport, normalizedDate)) {
     return existingReport;
   }
 
-  const { start, end } = createDayRange(normalizedDate);
-  const { start: previousStart, end: previousEnd } = createPreviousDayRange(normalizedDate);
+  const { start, end } = createDayRange(normalizedDate, timeZoneOffsetMinutes);
+  const { start: previousStart, end: previousEnd } = createPreviousDayRange(normalizedDate, timeZoneOffsetMinutes);
 
   const [allOrders, dailyOrders, previousDayOrders, products, analyticsEvents] = await Promise.all([
     Order.find({}).select("createdAt totalAmount status orderItems customer user").lean(),
@@ -522,6 +532,8 @@ const generateBusinessReportForDate = async (requestedDate = new Date()) => {
     dailyOrders,
     previousDayOrders,
     now: normalizedDate,
+    reportDateKey,
+    timeZoneOffsetMinutes,
   });
 
   const reportDoc = await BusinessReport.findOneAndUpdate(
@@ -2039,14 +2051,16 @@ app.get(["/admin/business-report", "/business-report"], adminAuth, requirePermis
   try {
     const rawDate = String(req.query.date || "").trim();
     const requestedDate = rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate)
-      ? new Date(Number(rawDate.slice(0, 4)), Number(rawDate.slice(5, 7)) - 1, Number(rawDate.slice(8, 10)))
+      ? new Date(Date.UTC(Number(rawDate.slice(0, 4)), Number(rawDate.slice(5, 7)) - 1, Number(rawDate.slice(8, 10))))
       : new Date(rawDate || new Date());
+    const rawTimeZoneOffset = Number(req.query.tzOffset);
+    const timeZoneOffsetMinutes = Number.isFinite(rawTimeZoneOffset) ? rawTimeZoneOffset : null;
 
     if (Number.isNaN(requestedDate.getTime())) {
       return res.status(400).json({ success: false, message: "Invalid date" });
     }
 
-    const reportDoc = await generateBusinessReportForDate(requestedDate);
+    const reportDoc = await generateBusinessReportForDate(requestedDate, timeZoneOffsetMinutes, rawDate || null);
     return res.json({ success: true, report: reportDoc });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
