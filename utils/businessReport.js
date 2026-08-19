@@ -166,6 +166,10 @@ const buildBusinessReportSnapshot = ({
   const revenue = resolvedDailyOrders.reduce((total, order) => total + Number(order?.totalAmount || 0), 0);
   const pendingOrders = resolvedDailyOrders.filter((order) => String(order?.status || "").trim().toLowerCase() === "pending").length;
   const approvedOrders = resolvedDailyOrders.filter((order) => String(order?.status || "").trim().toLowerCase() === "approved").length;
+  const rejectedOrders = resolvedDailyOrders.filter((order) => {
+    const normalizedStatus = String(order?.status || "").trim().toLowerCase();
+    return normalizedStatus === "rejected" || normalizedStatus === "cancelled" || normalizedStatus === "canceled";
+  }).length;
   const averageOrderValue = resolvedDailyOrders.length > 0 ? revenue / resolvedDailyOrders.length : 0;
 
   const productDemandMap = new Map();
@@ -388,6 +392,7 @@ const buildBusinessReportSnapshot = ({
       revenue,
       pendingOrders,
       approvedOrders,
+      rejectedOrders,
       averageOrderValue: Number(averageOrderValue.toFixed(2)),
     },
     demand: {

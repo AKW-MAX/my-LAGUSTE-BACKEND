@@ -287,6 +287,9 @@ const sendPasswordResetTokenEmail = async ({ to, accountLabel, token }) => {
       user: SMTP_USER,
       pass: SMTP_PASS,
     },
+    pool: true,
+    maxConnections: 3,
+    maxMessages: 10,
   });
 
   const ttlMinutes = PASSWORD_RESET_TOKEN_TTL_MINUTES;
@@ -297,12 +300,24 @@ const sendPasswordResetTokenEmail = async ({ to, accountLabel, token }) => {
     "If you did not request this, ignore this email.",
   ].join("\n");
 
-  await transporter.sendMail({
-    from: EMAIL_FROM,
-    to,
-    subject,
-    text,
-  });
+  try {
+    await transporter.sendMail({
+      from: EMAIL_FROM,
+      to,
+      subject,
+      text,
+    });
+  } catch (mailError) {
+    console.error("Password reset email delivery failed", {
+      message: mailError?.message,
+      code: mailError?.code,
+      response: mailError?.response,
+      responseCode: mailError?.responseCode,
+      to,
+      accountLabel,
+    });
+    throw mailError;
+  }
 };
 
 const sendBusinessReportEmail = async (report) => {
@@ -976,6 +991,14 @@ app.post("/admin/forgot-password/request", async (req, res) => {
       adminUser.passwordResetTokenExpires = null;
       await adminUser.save();
 
+      console.error("Admin forgot password email failed", {
+        message: emailError?.message,
+        code: emailError?.code,
+        response: emailError?.response,
+        responseCode: emailError?.responseCode,
+        email: adminUser.email,
+      });
+
       return res.status(500).json({
         success: false,
         message: emailError.message,
@@ -1111,6 +1134,14 @@ app.post("/forgot-password/request", async (req, res) => {
       customer.passwordResetTokenHash = "";
       customer.passwordResetTokenExpires = null;
       await customer.save();
+
+      console.error("Customer forgot password email failed", {
+        message: emailError?.message,
+        code: emailError?.code,
+        response: emailError?.response,
+        responseCode: emailError?.responseCode,
+        email: customer.email,
+      });
 
       return res.status(500).json({
         success: false,
