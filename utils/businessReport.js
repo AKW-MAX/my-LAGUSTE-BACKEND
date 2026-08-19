@@ -70,7 +70,32 @@ const shouldReuseExistingReport = (existingReport, requestedDate = new Date()) =
   const existingDate = toDate(existingReport.reportDate);
   const existingDateKey = existingDate ? toLocalDateString(existingDate) : String(existingReport.reportDate || "").trim().slice(0, 10);
 
-  return Boolean(requestedDateKey && existingDateKey && requestedDateKey === existingDateKey);
+  if (!requestedDateKey || !existingDateKey || requestedDateKey !== existingDateKey) {
+    return false;
+  }
+
+  const engagement = existingReport?.engagement || {};
+  const hasEngagementData = ["mostSearchedTerms", "mostClickedItems", "clickLocations", "topRegions", "sessionDuration"].every((key) => {
+    if (key === "sessionDuration") {
+      const sessionDuration = engagement?.sessionDuration || {};
+      return Number(sessionDuration?.averageSeconds) > 0 || Number(sessionDuration?.longestSeconds) > 0;
+    }
+
+    const value = engagement?.[key];
+    if (Array.isArray(value)) {
+      return value.length > 0;
+    }
+
+    return Boolean(value);
+  });
+  const hasCategoryData = Array.isArray(existingReport?.categories?.bestSelling) && existingReport.categories.bestSelling.length > 0;
+  const hasCustomerData = Object.prototype.hasOwnProperty.call(existingReport, "customers") && existingReport?.customers !== null && Number(existingReport?.customers?.repeatCustomers || 0) >= 0;
+
+  if (hasEngagementData && hasCategoryData && hasCustomerData) {
+    return true;
+  }
+
+  return false;
 };
 
 const normalizeProductName = (value) => String(value || "").trim();

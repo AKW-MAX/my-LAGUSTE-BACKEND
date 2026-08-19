@@ -4,6 +4,7 @@ const bcrypt = require('bcrypt');
 const { verifyCustomerPassword, normalizeCustomerEmail } = require('../utils/customerAuth');
 const { buildBusinessReportSnapshot, shouldReuseExistingReport, createDayRange } = require('../utils/businessReport');
 const { resolveEmailFromAddress } = require('../utils/smtpConfig');
+const BusinessReport = require('../models/businessReports');
 
 test('accepts legacy plain-text customer passwords and marks them for migration', async () => {
   const password = 'LegacyPass123!';
@@ -42,6 +43,21 @@ test('uses the authenticated Gmail address as the sender when Gmail SMTP is conf
   });
 
   assert.equal(fromAddress, 'sender@gmail.com');
+});
+
+test('persists engagement, category, and customer sections in saved reports', () => {
+  const doc = new BusinessReport({
+    reportDate: new Date('2024-08-09T00:00:00.000Z'),
+    engagement: { mostClickedItems: [{ name: 'Tomatoes', count: 2 }] },
+    categories: { bestSelling: [{ category: 'Vegetables', quantity: 5 }] },
+    customers: { repeatCustomers: 1 },
+  });
+
+  const plainDoc = doc.toObject();
+
+  assert.deepEqual(plainDoc.engagement.mostClickedItems[0].name, 'Tomatoes');
+  assert.deepEqual(plainDoc.categories.bestSelling[0].category, 'Vegetables');
+  assert.equal(plainDoc.customers.repeatCustomers, 1);
 });
 
 test('counts anonymous page views, product views, and cart activity in the daily report', () => {
@@ -157,15 +173,62 @@ test('groups clicked items by country and region', () => {
   assert.equal(report.engagement.clickLocations[0].count, 2);
 });
 
-test('reuses an existing same-day report when stored as a Date object', () => {
-  const existingReport = { reportDate: new Date(2024, 7, 9, 0, 0, 0) };
+test('rebuilds a stored report when the newer engagement and category sections are missing', () => {
+  const existingReport = { reportDate: '2024-08-09' };
+  const result = shouldReuseExistingReport(existingReport, new Date(2024, 7, 9, 14, 30, 0));
+
+  assert.equal(result, false);
+});
+
+test('reuses an existing same-day report when it already contains engagement and category sections', () => {
+  const existingReport = {
+    reportDate: new Date(2024, 7, 9, 0, 0, 0),
+    engagement: {
+      mostSearchedTerms: [{ term: 'fertilizer', count: 2 }],
+      mostClickedItems: [{ name: 'Tomatoes', count: 2 }],
+      clickLocations: [{ country: 'Kenya', region: 'Nairobi', count: 1 }],
+      topRegions: [{ label: 'Kenya / Nairobi', count: 1 }],
+      sessionDuration: { averageSeconds: 30, longestSeconds: 60 },
+    },
+    categories: { bestSelling: [{ category: 'Vegetables', quantity: 5 }] },
+    customers: { repeatCustomers: 1 },
+  };
   const result = shouldReuseExistingReport(existingReport, new Date(2024, 7, 9, 14, 30, 0));
 
   assert.equal(result, true);
 });
 
-test('reuses an existing same-day report instead of rebuilding it', () => {
-  const existingReport = { reportDate: '2024-08-09' };
+test('rebuilds a report when the engagement arrays are empty even if the keys exist', () => {
+  const existingReport = {
+    reportDate: '2024-08-09',
+    engagement: {
+      mostSearchedTerms: [],
+      mostClickedItems: [],
+      clickLocations: [],
+      topRegions: [],
+      sessionDuration: { averageSeconds: 0, longestSeconds: 0 },
+    },
+    categories: { bestSelling: [] },
+    customers: { repeatCustomers: 0 },
+  };
+  const result = shouldReuseExistingReport(existingReport, new Date(2024, 7, 9, 14, 30, 0));
+
+  assert.equal(result, false);
+});
+
+test('reuses an existing same-day report instead of rebuilding it when the modern sections are present', () => {
+  const existingReport = {
+    reportDate: '2024-08-09',
+    engagement: {
+      mostSearchedTerms: [{ term: 'fertilizer', count: 2 }],
+      mostClickedItems: [{ name: 'Tomatoes', count: 2 }],
+      clickLocations: [{ country: 'Kenya', region: 'Nairobi', count: 1 }],
+      topRegions: [{ label: 'Kenya / Nairobi', count: 1 }],
+      sessionDuration: { averageSeconds: 30, longestSeconds: 60 },
+    },
+    categories: { bestSelling: [{ category: 'Vegetables', quantity: 5 }] },
+    customers: { repeatCustomers: 1 },
+  };
   const result = shouldReuseExistingReport(existingReport, new Date(2024, 7, 9, 14, 30, 0));
 
   assert.equal(result, true);

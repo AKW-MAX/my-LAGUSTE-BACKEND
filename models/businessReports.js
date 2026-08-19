@@ -19,6 +19,18 @@ const businessReportSchema = new mongoose.Schema(
       type: Object,
       default: {},
     },
+    engagement: {
+      type: Object,
+      default: {},
+    },
+    categories: {
+      type: Object,
+      default: {},
+    },
+    customers: {
+      type: Object,
+      default: {},
+    },
     inventory: {
       type: Object,
       default: {},
