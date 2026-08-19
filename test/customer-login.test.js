@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const bcrypt = require('bcrypt');
 const { verifyCustomerPassword, normalizeCustomerEmail } = require('../utils/customerAuth');
 const { buildBusinessReportSnapshot, shouldReuseExistingReport, createDayRange } = require('../utils/businessReport');
+const { resolveEmailFromAddress } = require('../utils/smtpConfig');
 
 test('accepts legacy plain-text customer passwords and marks them for migration', async () => {
   const password = 'LegacyPass123!';
@@ -31,6 +32,16 @@ test('accepts passwords that differ only by surrounding whitespace', async () =>
 
 test('normalizes customer emails by trimming whitespace and lowercasing them', () => {
   assert.equal(normalizeCustomerEmail('  John@Example.COM '), 'john@example.com');
+});
+
+test('uses the authenticated Gmail address as the sender when Gmail SMTP is configured', () => {
+  const fromAddress = resolveEmailFromAddress({
+    host: 'smtp.gmail.com',
+    user: 'sender@gmail.com',
+    from: 'no-reply@example.com',
+  });
+
+  assert.equal(fromAddress, 'sender@gmail.com');
 });
 
 test('counts anonymous page views, product views, and cart activity in the daily report', () => {

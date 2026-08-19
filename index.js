@@ -18,7 +18,7 @@ const AnalyticsEvent = require("./models/analyticsEvents");
 const BusinessReport = require("./models/businessReports");
 const { buildBusinessReportSnapshot, formatCurrency, shouldReuseExistingReport, createDayRange, createPreviousDayRange } = require("./utils/businessReport");
 const { normalizeCustomerEmail, verifyCustomerPassword } = require("./utils/customerAuth");
-const { normalizeSmtpConfig } = require("./utils/smtpConfig");
+const { normalizeSmtpConfig, resolveEmailFromAddress } = require("./utils/smtpConfig");
 
 const app = express();
 app.use(express.json());
@@ -62,7 +62,7 @@ const SMTP_PORT = smtpConfig.port;
 const SMTP_USER = smtpConfig.user;
 const SMTP_PASS = smtpConfig.pass;
 const SMTP_SECURE = smtpConfig.secure;
-const EMAIL_FROM = smtpConfig.from;
+const EMAIL_FROM = resolveEmailFromAddress(smtpConfig);
 const DEFAULT_CONTACT_EMAIL = process.env.OWNER_EMAIL || "agriventureenterprise@gmail.com";
 const REPORT_RECIPIENT_EMAIL = process.env.REPORT_RECIPIENT_EMAIL || DEFAULT_CONTACT_EMAIL;
 const adminLoginRateMap = new Map();
@@ -301,6 +301,7 @@ const sendPasswordResetTokenEmail = async ({ to, accountLabel, token }) => {
   ].join("\n");
 
   try {
+    await transporter.verify();
     await transporter.sendMail({
       from: EMAIL_FROM,
       to,
@@ -352,6 +353,7 @@ const sendBusinessReportEmail = async (report) => {
     ...((report?.insights || []).map((insight) => `- ${insight}`)),
   ].join("\n");
 
+  await transporter.verify();
   await transporter.sendMail({
     from: EMAIL_FROM,
     to: REPORT_RECIPIENT_EMAIL,

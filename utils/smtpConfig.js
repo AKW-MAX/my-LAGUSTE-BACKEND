@@ -15,7 +15,20 @@ const normalizeSmtpConfig = (env = process.env) => ({
   from: normalizeSmtpValue(env.EMAIL_FROM || env.SMTP_USER),
 });
 
+const resolveEmailFromAddress = ({ host = "", user = "", from = "" } = {}) => {
+  const normalizedHost = String(host || "").trim().toLowerCase();
+  const normalizedUser = normalizeSmtpValue(user);
+  const normalizedFrom = normalizeSmtpValue(from);
+
+  if (normalizedHost === "smtp.gmail.com") {
+    return normalizedUser || normalizedFrom;
+  }
+
+  return normalizedFrom || normalizedUser;
+};
+
 module.exports = {
   normalizeSmtpConfig,
   normalizeSmtpValue,
+  resolveEmailFromAddress,
 };
