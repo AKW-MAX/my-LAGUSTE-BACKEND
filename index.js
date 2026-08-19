@@ -1005,6 +1005,9 @@ app.post("/admin/forgot-password/request", async (req, res) => {
         success: false,
         message: emailError.message,
         missingConfig: Array.isArray(emailError.missingConfig) ? emailError.missingConfig : undefined,
+        smtpCode: emailError?.code,
+        smtpResponse: emailError?.response,
+        smtpResponseCode: emailError?.responseCode,
       });
     }
 
@@ -1149,6 +1152,9 @@ app.post("/forgot-password/request", async (req, res) => {
         success: false,
         message: emailError.message,
         missingConfig: Array.isArray(emailError.missingConfig) ? emailError.missingConfig : undefined,
+        smtpCode: emailError?.code,
+        smtpResponse: emailError?.response,
+        smtpResponseCode: emailError?.responseCode,
       });
     }
 
