@@ -43,7 +43,7 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
-app.options('*', cors());
+app.options(/(.*)/, cors());
 
 const mongoUri = process.env.MONGO_URI;
 const ports = process.env.PORT || 5000;
