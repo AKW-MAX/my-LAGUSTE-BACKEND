@@ -90,6 +90,62 @@ test('surfaces demand signals with views, cart additions, and orders', () => {
   assert.equal(attentionWithoutSales.views, 1);
 });
 
+test('summarizes the most searched terms and most clicked items', () => {
+  const report = buildBusinessReportSnapshot({
+    orders: [],
+    products: [],
+    analyticsEvents: [
+      { eventType: 'search', createdAt: new Date(), metadata: { query: 'fertilizer' } },
+      { eventType: 'search', createdAt: new Date(), metadata: { query: 'fertilizer' } },
+      { eventType: 'search', createdAt: new Date(), metadata: { query: 'seeds' } },
+      { eventType: 'click_item', createdAt: new Date(), metadata: { productName: 'Tomatoes' } },
+      { eventType: 'click_item', createdAt: new Date(), metadata: { productName: 'Tomatoes' } },
+      { eventType: 'click_item', createdAt: new Date(), metadata: { productName: 'Broiler Booster' } },
+    ],
+    now: new Date(),
+  });
+
+  assert.deepEqual(report.engagement.mostSearchedTerms.map((item) => item.term), ['fertilizer', 'seeds']);
+  assert.deepEqual(report.engagement.mostClickedItems.map((item) => item.name), ['Tomatoes', 'Broiler Booster']);
+});
+
+test('groups clicks by country and region and computes session duration', () => {
+  const baseTime = new Date('2024-08-09T12:00:00.000Z');
+  const report = buildBusinessReportSnapshot({
+    orders: [],
+    products: [],
+    analyticsEvents: [
+      { eventType: 'click_item', createdAt: new Date(baseTime.getTime()), metadata: { productName: 'Tomatoes', country: 'Kenya', region: 'Rift Valley' }, sessionId: 'session-1' },
+      { eventType: 'click_item', createdAt: new Date(baseTime.getTime() + 60_000), metadata: { productName: 'Tomatoes', country: 'Kenya', region: 'Rift Valley' }, sessionId: 'session-1' },
+      { eventType: 'page_view', createdAt: new Date(baseTime.getTime()), metadata: { country: 'Kenya', region: 'Nairobi' }, sessionId: 'session-2' },
+      { eventType: 'page_view', createdAt: new Date(baseTime.getTime() + 180_000), metadata: { country: 'Kenya', region: 'Nairobi' }, sessionId: 'session-2' },
+    ],
+    now: baseTime,
+  });
+
+  assert.equal(report.engagement.locationBreakdown[0].country, 'Kenya');
+  assert.equal(report.engagement.locationBreakdown[0].region, 'Rift Valley');
+  assert.equal(report.engagement.locationBreakdown[0].count, 2);
+  assert.equal(report.engagement.sessionDuration.averageSeconds, 120);
+  assert.equal(report.engagement.sessionDuration.longestSeconds, 180);
+});
+
+test('groups clicked items by country and region', () => {
+  const report = buildBusinessReportSnapshot({
+    orders: [],
+    products: [],
+    analyticsEvents: [
+      { eventType: 'click_item', createdAt: new Date(), country: 'Kenya', region: 'Rift Valley', metadata: { productName: 'Tomatoes' } },
+      { eventType: 'click_item', createdAt: new Date(), country: 'Kenya', region: 'Rift Valley', metadata: { productName: 'Tomatoes' } },
+      { eventType: 'click_item', createdAt: new Date(), country: 'Kenya', region: 'Nairobi', metadata: { productName: 'Broiler Booster' } },
+    ],
+    now: new Date(),
+  });
+
+  assert.deepEqual(report.engagement.clickLocations.map((item) => `${item.country}/${item.region}`), ['Kenya/Rift Valley', 'Kenya/Nairobi']);
+  assert.equal(report.engagement.clickLocations[0].count, 2);
+});
+
 test('reuses an existing same-day report when stored as a Date object', () => {
   const existingReport = { reportDate: new Date(2024, 7, 9, 0, 0, 0) };
   const result = shouldReuseExistingReport(existingReport, new Date(2024, 7, 9, 14, 30, 0));

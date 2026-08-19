@@ -128,6 +128,16 @@ const isProductViewEvent = (event) => {
   return Boolean(productName) && !isPageViewEvent(event) && !isCartEvent(event);
 };
 
+const isSearchEvent = (event) => {
+  const type = String(event?.eventType || "").trim().toLowerCase();
+  return type === "search" || type === "search_query" || type === "search_term";
+};
+
+const isClickedItemEvent = (event) => {
+  const type = String(event?.eventType || "").trim().toLowerCase();
+  return type === "click_item" || type === "item_click" || type === "product_click";
+};
+
 const getEventProductReference = (event) => {
   const productName = inferProductNameFromEvent(event);
   const productId = inferProductIdFromEvent(event);
@@ -235,6 +245,49 @@ const buildBusinessReportSnapshot = ({
     viewedProductMap.set(reference, existing);
   });
 
+  const searchTermMap = new Map();
+  const clickedItemMap = new Map();
+  const clickLocationMap = new Map();
+  const sessionTimeline = new Map();
+
+  resolvedDailyEvents.forEach((event) => {
+    if (isSearchEvent(event)) {
+      const query = String(event?.metadata?.query || event?.query || event?.search || "").trim();
+      if (!query) return;
+
+      const existing = searchTermMap.get(query.toLowerCase()) || { term: query, count: 0 };
+      existing.count += 1;
+      searchTermMap.set(query.toLowerCase(), existing);
+    }
+
+    if (isClickedItemEvent(event)) {
+      const { productName, productId } = getEventProductReference(event);
+      const reference = productName || productId || String(event?.metadata?.itemName || event?.itemName || "").trim();
+      if (!reference) return;
+
+      const existing = clickedItemMap.get(reference.toLowerCase()) || { name: productName || reference, count: 0 };
+      existing.count += 1;
+      clickedItemMap.set(reference.toLowerCase(), existing);
+
+      const country = String(event?.country || event?.metadata?.country || "Unknown").trim() || "Unknown";
+      const region = String(event?.region || event?.metadata?.region || "Unknown").trim() || "Unknown";
+      const locationKey = `${country.toLowerCase()}::${region.toLowerCase()}`;
+      const locationEntry = clickLocationMap.get(locationKey) || { country, region, count: 0 };
+      locationEntry.count += 1;
+      clickLocationMap.set(locationKey, locationEntry);
+    }
+
+    const sessionId = String(event?.sessionId || event?.metadata?.sessionId || "").trim();
+    if (sessionId) {
+      const createdAt = toDate(event?.createdAt || event?.created_at);
+      if (createdAt) {
+        const sessionEvents = sessionTimeline.get(sessionId) || [];
+        sessionEvents.push(createdAt);
+        sessionTimeline.set(sessionId, sessionEvents);
+      }
+    }
+  });
+
   const productDemandSignals = new Map();
   const registerSignal = (reference, name, field, increment = 1) => {
     if (!reference) return;
@@ -317,6 +370,46 @@ const buildBusinessReportSnapshot = ({
     .filter((entry) => entry.views > 0 && entry.orders === 0)
     .sort((left, right) => right.views - left.views || right.cartAdditions - left.cartAdditions)
     .slice(0, 5);
+
+  const mostSearchedTerms = Array.from(searchTermMap.values())
+    .sort((left, right) => right.count - left.count || left.term.localeCompare(right.term))
+    .slice(0, 5);
+
+  const mostClickedItems = Array.from(clickedItemMap.values())
+    .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name))
+    .slice(0, 5);
+
+  const clickLocations = Array.from(clickLocationMap.values())
+    .sort((left, right) => right.count - left.count || left.country.localeCompare(right.country) || left.region.localeCompare(right.region))
+    .slice(0, 10);
+
+  const topRegions = Array.from(clickLocationMap.values())
+    .reduce((accumulator, location) => {
+      const key = `${location.country} / ${location.region}`;
+      const existing = accumulator.get(key) || { label: key, count: 0 };
+      existing.count += location.count;
+      accumulator.set(key, existing);
+      return accumulator;
+    }, new Map())
+    .values()
+    .toArray()
+    .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label))
+    .slice(0, 5);
+
+  const sessionDurations = Array.from(sessionTimeline.values())
+    .map((events) => events.slice().sort((left, right) => left.getTime() - right.getTime()))
+    .map((events) => {
+      if (events.length < 2) return 0;
+      return Math.max(0, Math.round((events[events.length - 1].getTime() - events[0].getTime()) / 1000));
+    })
+    .filter((value) => value > 0);
+
+  const averageSessionDuration = sessionDurations.length > 0
+    ? Math.round(sessionDurations.reduce((total, value) => total + value, 0) / sessionDurations.length)
+    : 0;
+  const longestSessionDuration = sessionDurations.length > 0
+    ? Math.max(...sessionDurations)
+    : 0;
 
   const lowStockProducts = (products || [])
     .filter((product) => Number(product?.stock || 0) <= 5)
@@ -403,6 +496,17 @@ const buildBusinessReportSnapshot = ({
       increasingDemandProducts,
       mostDemandedProducts,
       attentionWithoutSales,
+    },
+    engagement: {
+      mostSearchedTerms,
+      mostClickedItems,
+      clickLocations,
+      locationBreakdown: clickLocations,
+      topRegions,
+      sessionDuration: {
+        averageSeconds: averageSessionDuration,
+        longestSeconds: longestSessionDuration,
+      },
     },
     categories: {
       bestSelling: Array.from(categoryDemandMap.values()).sort((left, right) => right.quantity - left.quantity),

@@ -2061,6 +2061,23 @@ app.post("/admin/cloudinary/sign-upload", adminAuth, requirePermission("add_prod
 
 app.post(["/api/analytics", "/analytics"], async (req, res) => {
   try {
+    const incomingMetadata = req.body?.metadata || {};
+    const country = String(
+      incomingMetadata?.country ||
+        req.headers["cf-ipcountry"] ||
+        req.headers["x-vercel-ip-country"] ||
+        req.headers["x-country-code"] ||
+        req.headers["x-country"] ||
+        ""
+    ).trim();
+    const region = String(
+      incomingMetadata?.region ||
+        req.headers["cf-region-code"] ||
+        req.headers["x-region-code"] ||
+        req.headers["x-region"] ||
+        ""
+    ).trim();
+
     const eventPayload = {
       eventType: String(req.body?.eventType || "page_view").trim(),
       page: String(req.body?.page || "/").trim(),
@@ -2068,7 +2085,11 @@ app.post(["/api/analytics", "/analytics"], async (req, res) => {
       sessionId: String(req.body?.sessionId || "").trim(),
       ip: String(req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip || "").trim(),
       userAgent: String(req.headers["user-agent"] || "").trim(),
-      metadata: req.body?.metadata || {},
+      metadata: {
+        ...incomingMetadata,
+        ...(country ? { country } : {}),
+        ...(region ? { region } : {}),
+      },
     };
 
     const event = await AnalyticsEvent.create(eventPayload);
