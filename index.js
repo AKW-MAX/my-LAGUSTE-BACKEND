@@ -21,13 +21,29 @@ const { normalizeCustomerEmail, verifyCustomerPassword } = require("./utils/cust
 const { normalizeSmtpConfig, resolveEmailFromAddress } = require("./utils/smtpConfig");
 
 const app = express();
+const allowedOrigins = [
+  "https://www.agriventureenterprise.com",
+  "https://agriventureenterprise.com",
+  "http://localhost:5173",
+  "http://localhost:3000",
+  "http://localhost:5000",
+];
+
 app.use(express.json());
 app.use(cors({
-  origin: true,
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+
+    callback(new Error(`Origin not allowed by CORS: ${origin}`));
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
+app.options('*', cors());
 
 const mongoUri = process.env.MONGO_URI;
 const ports = process.env.PORT || 5000;
