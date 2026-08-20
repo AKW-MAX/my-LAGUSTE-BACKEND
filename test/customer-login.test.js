@@ -190,6 +190,22 @@ test('groups clicked items by country and region', () => {
   assert.equal(report.engagement.clickLocations[0].count, 2);
 });
 
+test('displays click location summaries as Unknown when analytics events do not contain valid location data', () => {
+  const report = buildBusinessReportSnapshot({
+    orders: [],
+    products: [],
+    analyticsEvents: [
+      { eventType: 'click_item', createdAt: new Date(), metadata: { productName: 'Tomatoes' } },
+      { eventType: 'click_item', createdAt: new Date(), metadata: { productName: 'Broiler Booster' } },
+    ],
+    now: new Date(),
+  });
+
+  assert.deepEqual(report.engagement.clickLocations, [{ country: 'Unknown', region: 'Unknown', count: 2 }]);
+  assert.deepEqual(report.engagement.clicksPerCountry, [{ country: 'Unknown', count: 2 }]);
+  assert.deepEqual(report.engagement.topRegions, [{ label: 'Unknown / Unknown', count: 2 }]);
+});
+
 test('rebuilds a stored report when the newer engagement and category sections are missing', () => {
   const existingReport = { reportDate: '2024-08-09' };
   const result = shouldReuseExistingReport(existingReport, new Date(2024, 7, 9, 14, 30, 0));

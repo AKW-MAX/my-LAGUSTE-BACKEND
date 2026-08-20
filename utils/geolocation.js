@@ -12,8 +12,75 @@ const normalizeLocationValue = (value) => {
   return normalized.length > 0 ? normalized : '';
 };
 
+const normalizeIpAddress = (value) => {
+  const text = String(value || '').trim();
+  if (!text) return '';
+
+  const withoutBrackets = text.replace(/^\[|\]$/g, '');
+  const trimmed = withoutBrackets.trim();
+
+  if (trimmed.startsWith('::ffff:') && /^::ffff:\d+\.\d+\.\d+\.\d+$/.test(trimmed)) {
+    return trimmed.replace('::ffff:', '');
+  }
+
+  if (trimmed === '::1' || trimmed === 'localhost') {
+    return '';
+  }
+
+  if (trimmed === '127.0.0.1' || trimmed === '0.0.0.0') {
+    return '';
+  }
+
+  return trimmed;
+};
+
+const isPrivateIp = (ip) => {
+  const normalized = normalizeIpAddress(ip);
+  if (!normalized) return true;
+
+  if (/^10\./.test(normalized) || /^192\.168\./.test(normalized) || /^172\.(1[6-9]|2\d|3[0-1])\./.test(normalized)) {
+    return true;
+  }
+
+  return normalized === '127.0.0.1' || normalized === '::1' || normalized === 'localhost';
+};
+
+const extractClientIp = (headers = {}) => {
+  const headerCandidates = [];
+  const forwardedFor = headers['x-forwarded-for'] || headers['X-Forwarded-For'];
+  if (forwardedFor) {
+    headerCandidates.push(...String(forwardedFor).split(','));
+  }
+
+  const realIp = headers['x-real-ip'] || headers['X-Real-IP'];
+  if (realIp) headerCandidates.push(String(realIp));
+
+  const cfConnectingIp = headers['cf-connecting-ip'] || headers['CF-Connecting-IP'];
+  if (cfConnectingIp) headerCandidates.push(String(cfConnectingIp));
+
+  const clientIp = headers['x-client-ip'] || headers['X-Client-IP'];
+  if (clientIp) headerCandidates.push(String(clientIp));
+
+  const forwarded = headers.forwarded || headers.Forwarded;
+  if (forwarded) {
+    const matches = String(forwarded).match(/for=(?:"?)([^;,"]+)(?:"?)/gi) || [];
+    matches.forEach((match) => {
+      const value = match.replace(/^for=/i, '').replace(/^"|"$/g, '');
+      headerCandidates.push(value);
+    });
+  }
+
+  const normalizedCandidates = headerCandidates
+    .map((value) => normalizeIpAddress(value))
+    .filter(Boolean);
+
+  const publicCandidate = normalizedCandidates.find((candidate) => !isPrivateIp(candidate));
+  return publicCandidate || normalizedCandidates[0] || '';
+};
+
 const resolveLocationFromIp = async (ip, fetchImpl = null) => {
-  if (!ip || ip === '::1' || ip === '127.0.0.1' || ip === 'localhost') {
+  const normalizedIp = normalizeIpAddress(ip);
+  if (!normalizedIp || isPrivateIp(normalizedIp)) {
     return { country: '', region: '' };
   }
 
@@ -38,7 +105,7 @@ const resolveLocationFromIp = async (ip, fetchImpl = null) => {
   }));
 
   try {
-    const resolvedUrl = providerUrl.replace('{ip}', encodeURIComponent(ip)) + providerPath.replace('{ip}', encodeURIComponent(ip));
+    const resolvedUrl = providerUrl.replace('{ip}', encodeURIComponent(normalizedIp)) + providerPath.replace('{ip}', encodeURIComponent(normalizedIp));
     const response = await fetcher(resolvedUrl);
     const payload = await response.json();
 
@@ -53,5 +120,7 @@ const resolveLocationFromIp = async (ip, fetchImpl = null) => {
 
 module.exports = {
   normalizeLocationValue,
+  normalizeIpAddress,
+  extractClientIp,
   resolveLocationFromIp,
 };

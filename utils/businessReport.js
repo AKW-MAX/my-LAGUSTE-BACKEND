@@ -174,6 +174,14 @@ const extractSearchTerm = (event) => {
   return candidates.find((candidate) => normalizeProductName(candidate)) || "";
 };
 
+const isValidLocationValue = (value) => {
+  const normalizedValue = normalizeProductName(value);
+  if (!normalizedValue) return false;
+
+  const lowered = normalizedValue.toLowerCase();
+  return !["unknown", "undefined", "null", "n/a", "na", "not available", "not provided"].includes(lowered);
+};
+
 const extractCountry = (event) => {
   const metadata = event?.metadata || {};
   const candidates = [
@@ -183,7 +191,7 @@ const extractCountry = (event) => {
     metadata.location?.country,
     event?.metadata?.country,
   ];
-  return candidates.find((candidate) => normalizeProductName(candidate)) || "Unknown";
+  return candidates.find((candidate) => isValidLocationValue(candidate)) || "Unknown";
 };
 
 const extractRegion = (event) => {
@@ -195,7 +203,7 @@ const extractRegion = (event) => {
     metadata.location?.region,
     event?.metadata?.region,
   ];
-  return candidates.find((candidate) => normalizeProductName(candidate)) || "Unknown";
+  return candidates.find((candidate) => isValidLocationValue(candidate)) || "Unknown";
 };
 
 const isPageViewEvent = (event) => {
@@ -490,13 +498,7 @@ const buildBusinessReportSnapshot = ({
     .sort((left, right) => right.count - left.count || left.country.localeCompare(right.country) || left.region.localeCompare(right.region))
     .slice(0, 10);
 
-  const fallbackClickLocations = Array.from(viewedProductMap.values()).map((entry, index) => ({
-    country: "Unknown",
-    region: "Unknown",
-    count: entry.count + index,
-  }));
-
-  const effectiveClickLocations = clickLocations.length > 0 ? clickLocations : fallbackClickLocations.slice(0, 5);
+  const effectiveClickLocations = clickLocations.length > 0 ? clickLocations : [{ country: 'Unknown', region: 'Unknown', count: 0 }];
 
   const clicksPerCountry = Array.from(
     clickLocationMap.values()
@@ -526,7 +528,7 @@ const buildBusinessReportSnapshot = ({
     .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label))
     .slice(0, 5);
 
-  const effectiveTopRegions = topRegions.length > 0 ? topRegions : [{ label: 'Unknown / Unknown', count: fallbackClickLocations.reduce((total, item) => total + item.count, 0) }];
+  const effectiveTopRegions = topRegions.length > 0 ? topRegions : [{ label: 'Unknown / Unknown', count: 0 }];
 
   const sessionDurations = Array.from(sessionTimeline.values())
     .map((events) => events.slice().sort((left, right) => left.getTime() - right.getTime()))

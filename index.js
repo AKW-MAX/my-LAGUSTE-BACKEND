@@ -19,7 +19,7 @@ const BusinessReport = require("./models/businessReports");
 const { buildBusinessReportSnapshot, formatCurrency, shouldReuseExistingReport, createDayRange, createPreviousDayRange } = require("./utils/businessReport");
 const { normalizeCustomerEmail, verifyCustomerPassword } = require("./utils/customerAuth");
 const { normalizeSmtpConfig, resolveEmailFromAddress } = require("./utils/smtpConfig");
-const { normalizeLocationValue, resolveLocationFromIp } = require("./utils/geolocation");
+const { normalizeLocationValue, resolveLocationFromIp, extractClientIp } = require("./utils/geolocation");
 const { createRequirePermission } = require("./utils/accessControl");
 
 const app = express();
@@ -2122,7 +2122,7 @@ app.post(["/api/analytics", "/analytics"], async (req, res) => {
   try {
     const incomingMetadata = req.body?.metadata || {};
     const incomingLocation = incomingMetadata?.location || req.body?.location || {};
-    const requestIp = String(req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip || "").trim();
+    const requestIp = extractClientIp(req.headers);
     const browserLocation = {
       country: normalizeLocationValue(incomingMetadata?.country || incomingLocation?.country || req.body?.country || ""),
       region: normalizeLocationValue(incomingMetadata?.region || incomingLocation?.region || req.body?.region || ""),
@@ -2153,7 +2153,7 @@ app.post(["/api/analytics", "/analytics"], async (req, res) => {
       page: String(req.body?.page || "/").trim(),
       referrer: String(req.body?.referrer || "").trim(),
       sessionId: String(req.body?.sessionId || "").trim(),
-      ip: String(req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip || "").trim(),
+      ip: requestIp,
       userAgent: String(req.headers["user-agent"] || "").trim(),
       metadata: {
         ...incomingMetadata,

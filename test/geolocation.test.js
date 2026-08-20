@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { normalizeLocationValue, resolveLocationFromIp } = require('../utils/geolocation');
+const { normalizeLocationValue, resolveLocationFromIp, extractClientIp } = require('../utils/geolocation');
 
 test('resolves country and region from geolocation provider data', async () => {
   const location = await resolveLocationFromIp('8.8.8.8', async () => ({
@@ -30,4 +30,13 @@ test('ignores timezone-like values so they do not masquerade as country or regio
   assert.equal(normalizeLocationValue('UTC'), '');
   assert.equal(normalizeLocationValue('Kenya'), 'Kenya');
   assert.equal(normalizeLocationValue('Nairobi'), 'Nairobi');
+});
+
+test('extracts a public client IP from forwarded headers', () => {
+  const ip = extractClientIp({
+    'x-forwarded-for': '10.0.0.1, 8.8.8.8',
+    'x-real-ip': '192.168.1.10',
+  });
+
+  assert.equal(ip, '8.8.8.8');
 });
