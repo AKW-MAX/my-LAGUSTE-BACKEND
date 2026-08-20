@@ -64,6 +64,7 @@ const ALL_ADMIN_PERMISSIONS = [
   "edit_admin_permissions",
   "sale_receipts",
   "generate_daily_report",
+  "view_region_analytics",
 ];
 const MAX_FAILED_LOGIN_ATTEMPTS = 5;
 const ADMIN_LOCK_MINUTES = 15;

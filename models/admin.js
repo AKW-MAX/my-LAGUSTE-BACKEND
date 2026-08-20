@@ -49,6 +49,8 @@ const adminSchema = new mongoose.Schema(
             "admin_activity",
             "edit_admin_permissions",
             "sale_receipts",
+            "generate_daily_report",
+            "view_region_analytics",
           ],
         },
       ],
