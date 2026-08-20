@@ -1,36 +1,22 @@
 const jwt = require("jsonwebtoken");
 const AdminModel = require("../models/admin");
 
-const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_SECRET = process.env.JWT_SECRET || "laguste-secret";
 
 module.exports = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
+    const fallbackToken = req.headers["x-admin-token"] || req.query.token || req.query.adminToken || "";
+    const rawToken = authHeader?.startsWith("Bearer ") ? authHeader.split(" ")[1] : fallbackToken;
 
-    if (!authHeader) {
+    if (!rawToken) {
       return res.status(401).json({
         success: false,
         message: "No token provided",
       });
     }
 
-    if (!authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid authorization format",
-      });
-    }
-
-    const token = authHeader.split(" ")[1];
-
-    if (!token) {
-      return res.status(401).json({
-        success: false,
-        message: "No token provided",
-      });
-    }
-
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(rawToken, JWT_SECRET);
 
     const adminUser = await AdminModel.findById(decoded.id).select(
       "_id username email role permissions approved"

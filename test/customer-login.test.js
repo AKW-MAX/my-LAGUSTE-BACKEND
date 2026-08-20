@@ -136,6 +136,23 @@ test('summarizes the most searched terms and most clicked items', () => {
   assert.deepEqual(report.engagement.mostClickedItems.map((item) => item.name), ['Tomatoes', 'Broiler Booster']);
 });
 
+test('uses viewed and clicked products as fallback sections when there are no searches or orders', () => {
+  const report = buildBusinessReportSnapshot({
+    orders: [],
+    products: [{ _id: 'product-1', name: 'Tomatoes', category: 'Vegetables', stock: 8 }],
+    analyticsEvents: [
+      { eventType: 'product_view', createdAt: new Date(), metadata: { productName: 'Tomatoes', productId: 'product-1' } },
+      { eventType: 'product_view', createdAt: new Date(), metadata: { productName: 'Tomatoes', productId: 'product-1' } },
+      { eventType: 'click_item', createdAt: new Date(), metadata: { productName: 'Tomatoes', productId: 'product-1' } },
+    ],
+    now: new Date(),
+  });
+
+  assert.deepEqual(report.engagement.mostSearchedTerms.map((item) => item.term), ['Tomatoes']);
+  assert.deepEqual(report.engagement.mostClickedItems.map((item) => item.name), ['Tomatoes']);
+  assert.deepEqual(report.categories.bestSelling.map((item) => item.category), ['Viewed products']);
+});
+
 test('groups clicks by country and region and computes session duration', () => {
   const baseTime = new Date('2024-08-09T12:00:00.000Z');
   const report = buildBusinessReportSnapshot({
@@ -176,6 +193,25 @@ test('groups clicked items by country and region', () => {
 test('rebuilds a stored report when the newer engagement and category sections are missing', () => {
   const existingReport = { reportDate: '2024-08-09' };
   const result = shouldReuseExistingReport(existingReport, new Date(2024, 7, 9, 14, 30, 0));
+
+  assert.equal(result, false);
+});
+
+test('skips reuse when a fresh rebuild is explicitly requested', () => {
+  const existingReport = {
+    reportDate: '2024-08-09',
+    engagement: {
+      mostSearchedTerms: [{ term: 'fertilizer', count: 2 }],
+      mostClickedItems: [{ name: 'Tomatoes', count: 2 }],
+      clickLocations: [{ country: 'Kenya', region: 'Nairobi', count: 1 }],
+      clicksPerCountry: [{ country: 'Kenya', count: 1 }],
+      topRegions: [{ label: 'Kenya / Nairobi', count: 1 }],
+      sessionDuration: { averageSeconds: 30, longestSeconds: 60 },
+    },
+    categories: { bestSelling: [{ category: 'Vegetables', quantity: 5 }] },
+    customers: { repeatCustomers: 1 },
+  };
+  const result = shouldReuseExistingReport(existingReport, new Date(2024, 7, 9, 14, 30, 0), null, { forceRefresh: true });
 
   assert.equal(result, false);
 });
@@ -277,6 +313,6 @@ test('reuses an existing same-day report instead of rebuilding it when the moder
 test('creates a day range using the supplied timezone offset', () => {
   const { start, end } = createDayRange(new Date('2024-08-09T00:00:00.000Z'), -180);
 
-  assert.equal(start.toISOString(), '2024-08-08T03:00:00.000Z');
-  assert.equal(end.toISOString(), '2024-08-09T03:00:00.000Z');
+  assert.equal(start.toISOString(), '2024-08-08T21:00:00.000Z');
+  assert.equal(end.toISOString(), '2024-08-09T21:00:00.000Z');
 });

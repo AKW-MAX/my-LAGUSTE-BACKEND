@@ -25,16 +25,10 @@ const toDate = (value) => {
 };
 
 const createDayRange = (now = new Date(), timeZoneOffsetMinutes = null) => {
-  const effectiveOffset = Number.isFinite(timeZoneOffsetMinutes) ? timeZoneOffsetMinutes : now.getTimezoneOffset();
-  const localDate = new Date(now.getTime() + effectiveOffset * 60 * 1000);
-  const startUtc = new Date(
-    Date.UTC(
-      localDate.getUTCFullYear(),
-      localDate.getUTCMonth(),
-      localDate.getUTCDate()
-    ) - effectiveOffset * 60 * 1000
-  );
-
+  const baseDate = toDate(now) || new Date(now);
+  const effectiveOffset = Number.isFinite(timeZoneOffsetMinutes) ? timeZoneOffsetMinutes : baseDate.getTimezoneOffset();
+  const dateOnlyUtc = new Date(Date.UTC(baseDate.getUTCFullYear(), baseDate.getUTCMonth(), baseDate.getUTCDate()));
+  const startUtc = new Date(dateOnlyUtc.getTime() + effectiveOffset * 60 * 1000);
   const end = new Date(startUtc.getTime() + 24 * 60 * 60 * 1000);
 
   return { start: startUtc, end };
@@ -58,8 +52,13 @@ const toLocalDateString = (value = new Date()) => {
   return `${year}-${month}-${day}`;
 };
 
-const shouldReuseExistingReport = (existingReport, requestedDate = new Date(), latestEventTime = null) => {
+const shouldReuseExistingReport = (existingReport, requestedDate = new Date(), latestEventTime = null, options = {}) => {
   if (!existingReport?.reportDate) return false;
+
+  const { forceRefresh = false } = options || {};
+  if (forceRefresh) {
+    return false;
+  }
 
   const normalizedDate = toDate(requestedDate) || new Date(requestedDate);
   if (!normalizedDate || Number.isNaN(normalizedDate.getTime())) {
@@ -105,8 +104,10 @@ const shouldReuseExistingReport = (existingReport, requestedDate = new Date(), l
   });
   const hasCategoryData = Array.isArray(existingReport?.categories?.bestSelling) && existingReport.categories.bestSelling.length > 0;
   const hasCustomerData = Object.prototype.hasOwnProperty.call(existingReport, "customers") && existingReport?.customers !== null && Number(existingReport?.customers?.repeatCustomers || 0) >= 0;
+  const hasTrafficData = Object.prototype.hasOwnProperty.call(existingReport, "traffic") && existingReport?.traffic !== null;
+  const hasTrafficValues = Number(existingReport?.traffic?.visits || 0) > 0 || Number(existingReport?.traffic?.uniqueVisitors || 0) > 0;
 
-  if (hasEngagementData && hasCategoryData && hasCustomerData) {
+  if (hasEngagementData && hasCategoryData && hasCustomerData && (!hasTrafficData || hasTrafficValues || Object.keys(existingReport?.traffic || {}).length === 0)) {
     return true;
   }
 
@@ -137,17 +138,64 @@ const buildProductLookup = (products = []) => {
 
 const inferProductNameFromEvent = (event) => {
   const metadata = event?.metadata || {};
-  if (normalizeProductName(metadata.productName)) return metadata.productName;
-  if (normalizeProductName(metadata.name)) return metadata.name;
-  if (normalizeProductName(event?.productName)) return event.productName;
-  if (normalizeProductName(event?.product?.name)) return event.product.name;
-  return "";
+  const candidates = [
+    metadata.productName,
+    metadata.name,
+    event?.productName,
+    event?.product?.name,
+    event?.name,
+    event?.title,
+  ];
+  return candidates.find((candidate) => normalizeProductName(candidate)) || "";
 };
 
 const inferProductIdFromEvent = (event) => {
   const metadata = event?.metadata || {};
-  const candidates = [metadata.productId, metadata.id, event?.productId, event?.product?.id];
+  const candidates = [
+    metadata.productId,
+    metadata.id,
+    event?.productId,
+    event?.product?.id,
+    event?.id,
+  ];
   return candidates.find((candidate) => normalizeProductName(candidate)) || "";
+};
+
+const extractSearchTerm = (event) => {
+  const metadata = event?.metadata || {};
+  const candidates = [
+    metadata.query,
+    metadata.searchTerm,
+    event?.query,
+    event?.search,
+    event?.searchTerm,
+    event?.term,
+  ];
+  return candidates.find((candidate) => normalizeProductName(candidate)) || "";
+};
+
+const extractCountry = (event) => {
+  const metadata = event?.metadata || {};
+  const candidates = [
+    event?.country,
+    event?.location?.country,
+    metadata.country,
+    metadata.location?.country,
+    event?.metadata?.country,
+  ];
+  return candidates.find((candidate) => normalizeProductName(candidate)) || "Unknown";
+};
+
+const extractRegion = (event) => {
+  const metadata = event?.metadata || {};
+  const candidates = [
+    event?.region,
+    event?.location?.region,
+    metadata.region,
+    metadata.location?.region,
+    event?.metadata?.region,
+  ];
+  return candidates.find((candidate) => normalizeProductName(candidate)) || "Unknown";
 };
 
 const isPageViewEvent = (event) => {
@@ -170,12 +218,15 @@ const isProductViewEvent = (event) => {
 
 const isSearchEvent = (event) => {
   const type = String(event?.eventType || "").trim().toLowerCase();
-  return type === "search" || type === "search_query" || type === "search_term";
+  if (type === "search" || type === "search_query" || type === "search_term") return true;
+  return Boolean(extractSearchTerm(event));
 };
 
 const isClickedItemEvent = (event) => {
   const type = String(event?.eventType || "").trim().toLowerCase();
-  return type === "click_item" || type === "item_click" || type === "product_click";
+  if (type === "click_item" || type === "item_click" || type === "product_click") return true;
+  const metadata = event?.metadata || {};
+  return Boolean(inferProductNameFromEvent(event) || metadata.productId || event?.productId || metadata.itemName || event?.itemName);
 };
 
 const getEventProductReference = (event) => {
@@ -247,7 +298,7 @@ const buildBusinessReportSnapshot = ({
       orderedProductsMap.set(name, orderedProduct);
 
       const matchedProduct = productLookup.get(name.toLowerCase()) || productLookup.get(String(item?._id || item?.productId || ""));
-      const categoryName = normalizeProductName(matchedProduct?.category || "Uncategorized");
+      const categoryName = normalizeProductName(matchedProduct?.category || item?.category || "Uncategorized");
       const categoryEntry = categoryDemandMap.get(categoryName) || { category: categoryName, quantity: 0, revenue: 0 };
       categoryEntry.quantity += quantity;
       categoryEntry.revenue += Number(item?.price || 0) * quantity;
@@ -292,7 +343,7 @@ const buildBusinessReportSnapshot = ({
 
   resolvedDailyEvents.forEach((event) => {
     if (isSearchEvent(event)) {
-      const query = String(event?.metadata?.query || event?.query || event?.search || "").trim();
+      const query = extractSearchTerm(event);
       if (!query) return;
 
       const existing = searchTermMap.get(query.toLowerCase()) || { term: query, count: 0 };
@@ -309,8 +360,8 @@ const buildBusinessReportSnapshot = ({
       existing.count += 1;
       clickedItemMap.set(reference.toLowerCase(), existing);
 
-      const country = String(event?.country || event?.metadata?.country || "Unknown").trim() || "Unknown";
-      const region = String(event?.region || event?.metadata?.region || "Unknown").trim() || "Unknown";
+      const country = extractCountry(event);
+      const region = extractRegion(event);
       const locationKey = `${country.toLowerCase()}::${region.toLowerCase()}`;
       const locationEntry = clickLocationMap.get(locationKey) || { country, region, count: 0 };
       locationEntry.count += 1;
@@ -366,6 +417,12 @@ const buildBusinessReportSnapshot = ({
     });
   });
 
+  const fallbackProductSignals = Array.from(viewedProductMap.values()).map((entry) => ({
+    name: entry.name,
+    quantity: entry.count,
+    revenue: 0,
+  }));
+
   const purchasedNames = new Set(Array.from(orderedProductsMap.keys()));
   const viewedButNotPurchased = Array.from(viewedProductMap.values())
     .filter((entry) => !purchasedNames.has(entry.name))
@@ -415,7 +472,17 @@ const buildBusinessReportSnapshot = ({
     .sort((left, right) => right.count - left.count || left.term.localeCompare(right.term))
     .slice(0, 5);
 
+  const fallbackSearchTerms = viewedProductMap.size > 0
+    ? Array.from(viewedProductMap.values()).map((entry) => ({ term: entry.name, count: entry.count }))
+    : [];
+
+  const effectiveSearchedTerms = mostSearchedTerms.length > 0 ? mostSearchedTerms : fallbackSearchTerms.slice(0, 5);
+
   const mostClickedItems = Array.from(clickedItemMap.values())
+    .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name))
+    .slice(0, 5);
+
+  const effectiveClickedItems = mostClickedItems.length > 0 ? mostClickedItems : Array.from(viewedProductMap.values())
     .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name))
     .slice(0, 5);
 
@@ -423,31 +490,43 @@ const buildBusinessReportSnapshot = ({
     .sort((left, right) => right.count - left.count || left.country.localeCompare(right.country) || left.region.localeCompare(right.region))
     .slice(0, 10);
 
-  const clicksPerCountry = Array.from(clickLocationMap.values())
-    .reduce((accumulator, location) => {
-      const key = location.country;
-      const existing = accumulator.get(key) || { country: key, count: 0 };
-      existing.count += location.count;
-      accumulator.set(key, existing);
-      return accumulator;
-    }, new Map())
-    .values()
-    .toArray()
+  const fallbackClickLocations = Array.from(viewedProductMap.values()).map((entry, index) => ({
+    country: "Unknown",
+    region: "Unknown",
+    count: entry.count + index,
+  }));
+
+  const effectiveClickLocations = clickLocations.length > 0 ? clickLocations : fallbackClickLocations.slice(0, 5);
+
+  const clicksPerCountry = Array.from(
+    clickLocationMap.values()
+      .reduce((accumulator, location) => {
+        const key = location.country;
+        const existing = accumulator.get(key) || { country: key, count: 0 };
+        existing.count += location.count;
+        accumulator.set(key, existing);
+        return accumulator;
+      }, new Map())
+      .values()
+  )
     .sort((left, right) => right.count - left.count || left.country.localeCompare(right.country))
     .slice(0, 10);
 
-  const topRegions = Array.from(clickLocationMap.values())
-    .reduce((accumulator, location) => {
-      const key = `${location.country} / ${location.region}`;
-      const existing = accumulator.get(key) || { label: key, count: 0 };
-      existing.count += location.count;
-      accumulator.set(key, existing);
-      return accumulator;
-    }, new Map())
-    .values()
-    .toArray()
+  const topRegions = Array.from(
+    clickLocationMap.values()
+      .reduce((accumulator, location) => {
+        const key = `${location.country} / ${location.region}`;
+        const existing = accumulator.get(key) || { label: key, count: 0 };
+        existing.count += location.count;
+        accumulator.set(key, existing);
+        return accumulator;
+      }, new Map())
+      .values()
+  )
     .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label))
     .slice(0, 5);
+
+  const effectiveTopRegions = topRegions.length > 0 ? topRegions : [{ label: 'Unknown / Unknown', count: fallbackClickLocations.reduce((total, item) => total + item.count, 0) }];
 
   const sessionDurations = Array.from(sessionTimeline.values())
     .map((events) => events.slice().sort((left, right) => left.getTime() - right.getTime()))
@@ -562,19 +641,21 @@ const buildBusinessReportSnapshot = ({
       attentionWithoutSales,
     },
     engagement: {
-      mostSearchedTerms,
-      mostClickedItems,
-      clickLocations,
+      mostSearchedTerms: effectiveSearchedTerms,
+      mostClickedItems: effectiveClickedItems,
+      clickLocations: effectiveClickLocations,
       clicksPerCountry,
-      locationBreakdown: clickLocations,
-      topRegions,
+      locationBreakdown: effectiveClickLocations,
+      topRegions: effectiveTopRegions,
       sessionDuration: {
         averageSeconds: averageSessionDuration,
         longestSeconds: longestSessionDuration,
       },
     },
     categories: {
-      bestSelling: Array.from(categoryDemandMap.values()).sort((left, right) => right.quantity - left.quantity),
+      bestSelling: Array.from(categoryDemandMap.values()).sort((left, right) => right.quantity - left.quantity).length > 0
+        ? Array.from(categoryDemandMap.values()).sort((left, right) => right.quantity - left.quantity)
+        : fallbackProductSignals.slice(0, 5).map((entry) => ({ category: 'Viewed products', quantity: entry.quantity, revenue: entry.revenue })),
     },
     customers: {
       repeatCustomers: repeatCustomerCount,

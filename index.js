@@ -20,6 +20,7 @@ const { buildBusinessReportSnapshot, formatCurrency, shouldReuseExistingReport, 
 const { normalizeCustomerEmail, verifyCustomerPassword } = require("./utils/customerAuth");
 const { normalizeSmtpConfig, resolveEmailFromAddress } = require("./utils/smtpConfig");
 const { normalizeLocationValue, resolveLocationFromIp } = require("./utils/geolocation");
+const { createRequirePermission } = require("./utils/accessControl");
 
 const app = express();
 const allowedOrigins = [
@@ -34,9 +35,7 @@ const allowedOrigins = [
   "http://127.0.0.1:3000",
   "http://127.0.0.1:5000",
 ];
-
-app.use(express.json());
-app.use(cors({
+const corsOptions = {
   origin: (origin, callback) => {
     if (!origin || allowedOrigins.includes(origin) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
       callback(null, true);
@@ -47,9 +46,12 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
-}));
-app.options(/(.*)/, cors());
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With', 'X-Admin-Token', 'x-admin-token'],
+};
+
+app.use(express.json());
+app.use(cors(corsOptions));
+app.options(/(.*)/, cors(corsOptions));
 
 const mongoUri = process.env.MONGO_URI;
 const ports = process.env.PORT || 5000;
@@ -477,22 +479,21 @@ const requireSuperAdmin = (req, res, next) => {
 };
 
 const requirePermission = (permission) => (req, res, next) => {
+  const permissions = Array.isArray(req.admin?.permissions) ? req.admin.permissions : [];
+  const requiredPermissions = Array.isArray(permission) ? permission : [permission];
+
   if (req.admin?.role === "superadmin") {
     return next();
   }
 
-  const permissions = Array.isArray(req.admin?.permissions)
-    ? req.admin.permissions
-    : [];
-
-  if (!permissions.includes(permission)) {
-    return res.status(403).json({
-      success: false,
-      message: `Missing required permission: ${permission}`,
-    });
+  if (requiredPermissions.some((entry) => permissions.includes(entry))) {
+    return next();
   }
 
-  return next();
+  return res.status(403).json({
+    success: false,
+    message: `Missing required permission: ${requiredPermissions.join(" or ")}`,
+  });
 };
 
 const normalizeBooleanValue = (value) => {
@@ -519,6 +520,22 @@ const normalizeBooleanValue = (value) => {
   return false;
 };
 
+const parseReportDateInput = (value) => {
+  if (typeof value !== "string") return null;
+
+  const trimmed = value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    return null;
+  }
+
+  const [year, month, day] = trimmed.split("-").map(Number);
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) {
+    return null;
+  }
+
+  return new Date(Date.UTC(year, month - 1, day));
+};
+
 const normalizeProductPayload = (body = {}, options = {}) => {
   const normalizedBody = { ...(body || {}) };
   const defaultShowInNewProducts = options.defaultShowInNewProducts;
@@ -542,19 +559,22 @@ const serializeProduct = (product) => {
 };
 
 /* ---------------- CONNECT DB ---------------- */
-const generateBusinessReportForDate = async (requestedDate = new Date(), timeZoneOffsetMinutes = null, reportDateKeyOverride = null) => {
+const generateBusinessReportForDate = async (requestedDate = new Date(), timeZoneOffsetMinutes = null, reportDateKeyOverride = null, forceRefresh = false) => {
   const normalizedDate = requestedDate instanceof Date && !Number.isNaN(requestedDate.getTime())
     ? requestedDate
     : new Date();
 
   const reportDateKey = reportDateKeyOverride || `${normalizedDate.getUTCFullYear()}-${String(normalizedDate.getUTCMonth() + 1).padStart(2, "0")}-${String(normalizedDate.getUTCDate()).padStart(2, "0")}`;
-  const { start, end } = createDayRange(normalizedDate, timeZoneOffsetMinutes);
+  const requestedDateForWindow = reportDateKeyOverride ? parseReportDateInput(reportDateKeyOverride) || normalizedDate : normalizedDate;
+  const reportDateForWindow = reportDateKeyOverride ? parseReportDateInput(reportDateKeyOverride) || requestedDateForWindow : requestedDateForWindow;
+  const reportDateQuery = reportDateKeyOverride || `${reportDateForWindow.getUTCFullYear()}-${String(reportDateForWindow.getUTCMonth() + 1).padStart(2, "0")}-${String(reportDateForWindow.getUTCDate()).padStart(2, "0")}`;
+  const { start, end } = createDayRange(reportDateForWindow, timeZoneOffsetMinutes);
   const [existingReport, latestAnalyticsEvent] = await Promise.all([
-    BusinessReport.findOne({ reportDate: reportDateKey }).lean(),
+    BusinessReport.findOne({ reportDate: { $in: [reportDateKey, reportDateQuery, new Date(reportDateKey)] } }).lean(),
     AnalyticsEvent.findOne({ createdAt: { $gte: start, $lt: end } }).sort({ createdAt: -1 }).select("createdAt").lean(),
   ]);
 
-  if (existingReport && shouldReuseExistingReport(existingReport, normalizedDate, latestAnalyticsEvent?.createdAt)) {
+  if (existingReport && shouldReuseExistingReport(existingReport, normalizedDate, latestAnalyticsEvent?.createdAt, { forceRefresh })) {
     return existingReport;
   }
   const { start: previousStart, end: previousEnd } = createPreviousDayRange(normalizedDate, timeZoneOffsetMinutes);
@@ -579,7 +599,7 @@ const generateBusinessReportForDate = async (requestedDate = new Date(), timeZon
   });
 
   const reportDoc = await BusinessReport.findOneAndUpdate(
-    { reportDate: snapshot.reportDate },
+    { reportDate: { $in: [snapshot.reportDate, reportDateQuery, reportDateKey] } },
     {
       $set: {
         ...snapshot,
@@ -2101,10 +2121,11 @@ app.post("/admin/cloudinary/sign-upload", adminAuth, requirePermission("add_prod
 app.post(["/api/analytics", "/analytics"], async (req, res) => {
   try {
     const incomingMetadata = req.body?.metadata || {};
+    const incomingLocation = incomingMetadata?.location || req.body?.location || {};
     const requestIp = String(req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip || "").trim();
     const browserLocation = {
-      country: normalizeLocationValue(incomingMetadata?.country || req.body?.country || ""),
-      region: normalizeLocationValue(incomingMetadata?.region || req.body?.region || ""),
+      country: normalizeLocationValue(incomingMetadata?.country || incomingLocation?.country || req.body?.country || ""),
+      region: normalizeLocationValue(incomingMetadata?.region || incomingLocation?.region || req.body?.region || ""),
     };
 
     const resolvedLocation = browserLocation.country || browserLocation.region
@@ -2141,6 +2162,8 @@ app.post(["/api/analytics", "/analytics"], async (req, res) => {
       },
     };
 
+    console.log(`[analytics] ${eventPayload.eventType} page=${eventPayload.page} metadata=${JSON.stringify(eventPayload.metadata)}`);
+
     const event = await AnalyticsEvent.create(eventPayload);
     return res.status(201).json({ success: true, event });
   } catch (err) {
@@ -2148,7 +2171,7 @@ app.post(["/api/analytics", "/analytics"], async (req, res) => {
   }
 });
 
-app.get(["/admin/business-report", "/business-report"], adminAuth, requirePermission("audit_logs"), async (req, res) => {
+app.get(["/admin/business-report", "/business-report"], adminAuth, requirePermission(["generate_daily_report", "view_region_analytics", "audit_logs"]), async (req, res) => {
   try {
     const rawDate = String(req.query.date || "").trim();
     const requestedDate = rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate)
@@ -2156,19 +2179,20 @@ app.get(["/admin/business-report", "/business-report"], adminAuth, requirePermis
       : new Date(rawDate || new Date());
     const rawTimeZoneOffset = Number(req.query.tzOffset);
     const timeZoneOffsetMinutes = Number.isFinite(rawTimeZoneOffset) ? rawTimeZoneOffset : null;
+    const forceRefresh = ["1", "true", "yes", "on"].includes(String(req.query.refresh || req.query.force || "").trim().toLowerCase());
 
     if (Number.isNaN(requestedDate.getTime())) {
       return res.status(400).json({ success: false, message: "Invalid date" });
     }
 
-    const reportDoc = await generateBusinessReportForDate(requestedDate, timeZoneOffsetMinutes, rawDate || null);
+    const reportDoc = await generateBusinessReportForDate(requestedDate, timeZoneOffsetMinutes, rawDate || null, forceRefresh);
     return res.json({ success: true, report: reportDoc });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
 });
 
-app.get(["/admin/business-report/latest", "/business-report/latest"], adminAuth, requirePermission("audit_logs"), async (req, res) => {
+app.get(["/admin/business-report/latest", "/business-report/latest"], adminAuth, requirePermission(["generate_daily_report", "view_region_analytics", "audit_logs"]), async (req, res) => {
   try {
     const report = await BusinessReport.findOne({}).sort({ reportDate: -1 }).lean();
     return res.json({ success: true, report });
