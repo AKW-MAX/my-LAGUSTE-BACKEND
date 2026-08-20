@@ -19,7 +19,7 @@ const BusinessReport = require("./models/businessReports");
 const { buildBusinessReportSnapshot, formatCurrency, shouldReuseExistingReport, createDayRange, createPreviousDayRange } = require("./utils/businessReport");
 const { normalizeCustomerEmail, verifyCustomerPassword } = require("./utils/customerAuth");
 const { normalizeSmtpConfig, resolveEmailFromAddress } = require("./utils/smtpConfig");
-const { resolveLocationFromIp } = require("./utils/geolocation");
+const { normalizeLocationValue, resolveLocationFromIp } = require("./utils/geolocation");
 
 const app = express();
 const allowedOrigins = [
@@ -548,13 +548,15 @@ const generateBusinessReportForDate = async (requestedDate = new Date(), timeZon
     : new Date();
 
   const reportDateKey = reportDateKeyOverride || `${normalizedDate.getUTCFullYear()}-${String(normalizedDate.getUTCMonth() + 1).padStart(2, "0")}-${String(normalizedDate.getUTCDate()).padStart(2, "0")}`;
-  const existingReport = await BusinessReport.findOne({ reportDate: reportDateKey }).lean();
+  const { start, end } = createDayRange(normalizedDate, timeZoneOffsetMinutes);
+  const [existingReport, latestAnalyticsEvent] = await Promise.all([
+    BusinessReport.findOne({ reportDate: reportDateKey }).lean(),
+    AnalyticsEvent.findOne({ createdAt: { $gte: start, $lt: end } }).sort({ createdAt: -1 }).select("createdAt").lean(),
+  ]);
 
-  if (existingReport && shouldReuseExistingReport(existingReport, normalizedDate)) {
+  if (existingReport && shouldReuseExistingReport(existingReport, normalizedDate, latestAnalyticsEvent?.createdAt)) {
     return existingReport;
   }
-
-  const { start, end } = createDayRange(normalizedDate, timeZoneOffsetMinutes);
   const { start: previousStart, end: previousEnd } = createPreviousDayRange(normalizedDate, timeZoneOffsetMinutes);
 
   const [allOrders, dailyOrders, previousDayOrders, products, analyticsEvents] = await Promise.all([
@@ -2101,29 +2103,29 @@ app.post(["/api/analytics", "/analytics"], async (req, res) => {
     const incomingMetadata = req.body?.metadata || {};
     const requestIp = String(req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip || "").trim();
     const browserLocation = {
-      country: String(incomingMetadata?.country || req.body?.country || "").trim(),
-      region: String(incomingMetadata?.region || req.body?.region || "").trim(),
+      country: normalizeLocationValue(incomingMetadata?.country || req.body?.country || ""),
+      region: normalizeLocationValue(incomingMetadata?.region || req.body?.region || ""),
     };
 
     const resolvedLocation = browserLocation.country || browserLocation.region
       ? browserLocation
       : await resolveLocationFromIp(requestIp);
 
-    const country = String(
+    const country = normalizeLocationValue(
       resolvedLocation?.country ||
         req.headers["cf-ipcountry"] ||
         req.headers["x-vercel-ip-country"] ||
         req.headers["x-country-code"] ||
         req.headers["x-country"] ||
         ""
-    ).trim();
-    const region = String(
+    );
+    const region = normalizeLocationValue(
       resolvedLocation?.region ||
         req.headers["cf-region-code"] ||
         req.headers["x-region-code"] ||
         req.headers["x-region"] ||
         ""
-    ).trim();
+    );
 
     const eventPayload = {
       eventType: String(req.body?.eventType || "page_view").trim(),

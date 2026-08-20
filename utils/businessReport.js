@@ -58,7 +58,7 @@ const toLocalDateString = (value = new Date()) => {
   return `${year}-${month}-${day}`;
 };
 
-const shouldReuseExistingReport = (existingReport, requestedDate = new Date()) => {
+const shouldReuseExistingReport = (existingReport, requestedDate = new Date(), latestEventTime = null) => {
   if (!existingReport?.reportDate) return false;
 
   const normalizedDate = toDate(requestedDate) || new Date(requestedDate);
@@ -71,6 +71,12 @@ const shouldReuseExistingReport = (existingReport, requestedDate = new Date()) =
   const existingDateKey = existingDate ? toLocalDateString(existingDate) : String(existingReport.reportDate || "").trim().slice(0, 10);
 
   if (!requestedDateKey || !existingDateKey || requestedDateKey !== existingDateKey) {
+    return false;
+  }
+
+  const generatedAt = toDate(existingReport?.generatedAt);
+  const latestAnalyticsAt = toDate(latestEventTime);
+  if (generatedAt && latestAnalyticsAt && latestAnalyticsAt.getTime() > generatedAt.getTime()) {
     return false;
   }
 

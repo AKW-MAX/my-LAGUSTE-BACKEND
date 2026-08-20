@@ -199,6 +199,26 @@ test('reuses an existing same-day report when it already contains engagement and
   assert.equal(result, true);
 });
 
+test('rebuilds a same-day report when newer analytics events arrived after the report was generated', () => {
+  const existingReport = {
+    reportDate: '2024-08-09',
+    generatedAt: new Date('2024-08-09T00:00:00.000Z'),
+    engagement: {
+      mostSearchedTerms: [{ term: 'fertilizer', count: 2 }],
+      mostClickedItems: [{ name: 'Tomatoes', count: 2 }],
+      clickLocations: [{ country: 'Kenya', region: 'Nairobi', count: 1 }],
+      clicksPerCountry: [{ country: 'Kenya', count: 1 }],
+      topRegions: [{ label: 'Kenya / Nairobi', count: 1 }],
+      sessionDuration: { averageSeconds: 30, longestSeconds: 60 },
+    },
+    categories: { bestSelling: [{ category: 'Vegetables', quantity: 5 }] },
+    customers: { repeatCustomers: 1 },
+  };
+  const result = shouldReuseExistingReport(existingReport, new Date(2024, 7, 9, 14, 30, 0), new Date('2024-08-09T01:00:00.000Z'));
+
+  assert.equal(result, false);
+});
+
 test('rebuilds a report when the new country-level engagement summary is missing', () => {
   const existingReport = {
     reportDate: '2024-08-09',
