@@ -19,20 +19,26 @@ const BusinessReport = require("./models/businessReports");
 const { buildBusinessReportSnapshot, formatCurrency, shouldReuseExistingReport, createDayRange, createPreviousDayRange } = require("./utils/businessReport");
 const { normalizeCustomerEmail, verifyCustomerPassword } = require("./utils/customerAuth");
 const { normalizeSmtpConfig, resolveEmailFromAddress } = require("./utils/smtpConfig");
+const { resolveLocationFromIp } = require("./utils/geolocation");
 
 const app = express();
 const allowedOrigins = [
   "https://www.agriventureenterprise.com",
   "https://agriventureenterprise.com",
   "http://localhost:5173",
+  "http://localhost:5174",
   "http://localhost:3000",
   "http://localhost:5000",
+  "http://127.0.0.1:5173",
+  "http://127.0.0.1:5174",
+  "http://127.0.0.1:3000",
+  "http://127.0.0.1:5000",
 ];
 
 app.use(express.json());
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
+    if (!origin || allowedOrigins.includes(origin) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
       callback(null, true);
       return;
     }
@@ -41,7 +47,7 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
 }));
 app.options(/(.*)/, cors());
 
@@ -953,9 +959,15 @@ app.post("/admin/login", async (req, res) => {
       details: "Login successful",
     });
   } catch (err) {
+    console.error("Admin login failed", {
+      message: err?.message,
+      stack: err?.stack,
+      username: String(req.body?.username || "").trim(),
+    });
+
     res.status(500).json({
       success: false,
-      message: err.message,
+      message: err?.message || "Admin login failed",
     });
   }
 });
@@ -2086,8 +2098,18 @@ app.post("/admin/cloudinary/sign-upload", adminAuth, requirePermission("add_prod
 app.post(["/api/analytics", "/analytics"], async (req, res) => {
   try {
     const incomingMetadata = req.body?.metadata || {};
+    const requestIp = String(req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip || "").trim();
+    const browserLocation = {
+      country: String(incomingMetadata?.country || req.body?.country || "").trim(),
+      region: String(incomingMetadata?.region || req.body?.region || "").trim(),
+    };
+
+    const resolvedLocation = browserLocation.country || browserLocation.region
+      ? browserLocation
+      : await resolveLocationFromIp(requestIp);
+
     const country = String(
-      incomingMetadata?.country ||
+      resolvedLocation?.country ||
         req.headers["cf-ipcountry"] ||
         req.headers["x-vercel-ip-country"] ||
         req.headers["x-country-code"] ||
@@ -2095,7 +2117,7 @@ app.post(["/api/analytics", "/analytics"], async (req, res) => {
         ""
     ).trim();
     const region = String(
-      incomingMetadata?.region ||
+      resolvedLocation?.region ||
         req.headers["cf-region-code"] ||
         req.headers["x-region-code"] ||
         req.headers["x-region"] ||

@@ -187,6 +187,7 @@ test('reuses an existing same-day report when it already contains engagement and
       mostSearchedTerms: [{ term: 'fertilizer', count: 2 }],
       mostClickedItems: [{ name: 'Tomatoes', count: 2 }],
       clickLocations: [{ country: 'Kenya', region: 'Nairobi', count: 1 }],
+      clicksPerCountry: [{ country: 'Kenya', count: 1 }],
       topRegions: [{ label: 'Kenya / Nairobi', count: 1 }],
       sessionDuration: { averageSeconds: 30, longestSeconds: 60 },
     },
@@ -196,6 +197,24 @@ test('reuses an existing same-day report when it already contains engagement and
   const result = shouldReuseExistingReport(existingReport, new Date(2024, 7, 9, 14, 30, 0));
 
   assert.equal(result, true);
+});
+
+test('rebuilds a report when the new country-level engagement summary is missing', () => {
+  const existingReport = {
+    reportDate: '2024-08-09',
+    engagement: {
+      mostSearchedTerms: [{ term: 'fertilizer', count: 2 }],
+      mostClickedItems: [{ name: 'Tomatoes', count: 2 }],
+      clickLocations: [{ country: 'Kenya', region: 'Nairobi', count: 1 }],
+      topRegions: [{ label: 'Kenya / Nairobi', count: 1 }],
+      sessionDuration: { averageSeconds: 30, longestSeconds: 60 },
+    },
+    categories: { bestSelling: [{ category: 'Vegetables', quantity: 5 }] },
+    customers: { repeatCustomers: 1 },
+  };
+  const result = shouldReuseExistingReport(existingReport, new Date(2024, 7, 9, 14, 30, 0));
+
+  assert.equal(result, false);
 });
 
 test('rebuilds a report when the engagement arrays are empty even if the keys exist', () => {
@@ -223,6 +242,7 @@ test('reuses an existing same-day report instead of rebuilding it when the moder
       mostSearchedTerms: [{ term: 'fertilizer', count: 2 }],
       mostClickedItems: [{ name: 'Tomatoes', count: 2 }],
       clickLocations: [{ country: 'Kenya', region: 'Nairobi', count: 1 }],
+      clicksPerCountry: [{ country: 'Kenya', count: 1 }],
       topRegions: [{ label: 'Kenya / Nairobi', count: 1 }],
       sessionDuration: { averageSeconds: 30, longestSeconds: 60 },
     },

@@ -75,10 +75,19 @@ const shouldReuseExistingReport = (existingReport, requestedDate = new Date()) =
   }
 
   const engagement = existingReport?.engagement || {};
-  const hasEngagementData = ["mostSearchedTerms", "mostClickedItems", "clickLocations", "topRegions", "sessionDuration"].every((key) => {
+  const hasEngagementData = ["mostSearchedTerms", "mostClickedItems", "clickLocations", "clicksPerCountry", "topRegions", "sessionDuration"].every((key) => {
     if (key === "sessionDuration") {
       const sessionDuration = engagement?.sessionDuration || {};
       return Number(sessionDuration?.averageSeconds) > 0 || Number(sessionDuration?.longestSeconds) > 0;
+    }
+
+    if (key === "clicksPerCountry") {
+      const value = engagement?.[key];
+      if (Array.isArray(value)) {
+        return value.length > 0;
+      }
+
+      return Boolean(value);
     }
 
     const value = engagement?.[key];
@@ -408,6 +417,19 @@ const buildBusinessReportSnapshot = ({
     .sort((left, right) => right.count - left.count || left.country.localeCompare(right.country) || left.region.localeCompare(right.region))
     .slice(0, 10);
 
+  const clicksPerCountry = Array.from(clickLocationMap.values())
+    .reduce((accumulator, location) => {
+      const key = location.country;
+      const existing = accumulator.get(key) || { country: key, count: 0 };
+      existing.count += location.count;
+      accumulator.set(key, existing);
+      return accumulator;
+    }, new Map())
+    .values()
+    .toArray()
+    .sort((left, right) => right.count - left.count || left.country.localeCompare(right.country))
+    .slice(0, 10);
+
   const topRegions = Array.from(clickLocationMap.values())
     .reduce((accumulator, location) => {
       const key = `${location.country} / ${location.region}`;
@@ -428,6 +450,17 @@ const buildBusinessReportSnapshot = ({
       return Math.max(0, Math.round((events[events.length - 1].getTime() - events[0].getTime()) / 1000));
     })
     .filter((value) => value > 0);
+
+  if (sessionDurations.length === 0) {
+    const fallbackEvents = resolvedDailyEvents
+      .map((event) => toDate(event?.createdAt || event?.created_at))
+      .filter(Boolean)
+      .sort((left, right) => left.getTime() - right.getTime());
+
+    if (fallbackEvents.length >= 2) {
+      sessionDurations.push(Math.max(0, Math.round((fallbackEvents[fallbackEvents.length - 1].getTime() - fallbackEvents[0].getTime()) / 1000)));
+    }
+  }
 
   const averageSessionDuration = sessionDurations.length > 0
     ? Math.round(sessionDurations.reduce((total, value) => total + value, 0) / sessionDurations.length)
@@ -526,6 +559,7 @@ const buildBusinessReportSnapshot = ({
       mostSearchedTerms,
       mostClickedItems,
       clickLocations,
+      clicksPerCountry,
       locationBreakdown: clickLocations,
       topRegions,
       sessionDuration: {
